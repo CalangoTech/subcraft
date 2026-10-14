@@ -17,3 +17,4 @@ half.workspace = true
 rayon.workspace = true
 serde.workspace = true
 log.workspace = true
+web-time.workspace = true

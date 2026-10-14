@@ -38,12 +38,26 @@ pub struct Bvh {
     e2: Vec<Vec3>,
 }
 
+/// Read-only, depth-first BVH node for stackless compute traversal.
+/// On a box miss, jump to `escape`; on an interior hit, advance to the next node.
+/// `escape == nodes.len()` terminates traversal. Leaves reference [`Bvh::triangle_order`].
+#[derive(Clone, Copy, Debug)]
+pub struct TraversalNode {
+    pub min: Vec3,
+    pub max: Vec3,
+    pub first: u32,
+    pub count: u32,
+    pub escape: u32,
+}
+
 const BINS: usize = 16;
 const MAX_LEAF: u32 = 4;
 
 impl Bvh {
     pub fn build(mesh: &Mesh) -> Self {
-        let tris: Vec<[Vec3; 3]> = (0..mesh.triangle_count()).map(|t| mesh.tri_positions(t)).collect();
+        let tris: Vec<[Vec3; 3]> = (0..mesh.triangle_count())
+            .map(|t| mesh.tri_positions(t))
+            .collect();
         Self::from_triangles(&tris)
     }
 
@@ -60,12 +74,23 @@ impl Bvh {
             return bvh;
         }
         let centroids: Vec<Vec3> = tris.iter().map(|t| (t[0] + t[1] + t[2]) / 3.0).collect();
-        let boxes: Vec<Aabb> = tris.iter().map(|t| Aabb::from_points(t.iter().copied())).collect();
+        let boxes: Vec<Aabb> = tris
+            .iter()
+            .map(|t| Aabb::from_points(t.iter().copied()))
+            .collect();
 
-        bvh.nodes.push(Node { min: Vec3::ZERO, left_first: 0, max: Vec3::ZERO, count: n as u32 });
+        bvh.nodes.push(Node {
+            min: Vec3::ZERO,
+            left_first: 0,
+            max: Vec3::ZERO,
+            count: n as u32,
+        });
         let mut stack = vec![0usize];
         while let Some(ni) = stack.pop() {
-            let (first, count) = (bvh.nodes[ni].left_first as usize, bvh.nodes[ni].count as usize);
+            let (first, count) = (
+                bvh.nodes[ni].left_first as usize,
+                bvh.nodes[ni].count as usize,
+            );
             let ids = &bvh.tri_ids[first..first + count];
             let mut nb = Aabb::EMPTY;
             let mut cb = Aabb::EMPTY;
@@ -89,7 +114,8 @@ impl Bvh {
                 let mut bin_cnt = [0u32; BINS];
                 let scale = BINS as f32 / ext[axis];
                 for &t in ids {
-                    let b = (((centroids[t as usize][axis] - cb.min[axis]) * scale) as usize).min(BINS - 1);
+                    let b = (((centroids[t as usize][axis] - cb.min[axis]) * scale) as usize)
+                        .min(BINS - 1);
                     bin_cnt[b] += 1;
                     bin_box[b] = bin_box[b].merge(&boxes[t as usize]);
                 }
@@ -108,7 +134,8 @@ impl Bvh {
                 for i in (1..BINS).rev() {
                     acc = acc.merge(&bin_box[i]);
                     c += bin_cnt[i];
-                    let cost = left_cnt[i - 1] as f32 * left_area[i - 1] + c as f32 * if c > 0 { acc.surface_area() } else { 0.0 };
+                    let cost = left_cnt[i - 1] as f32 * left_area[i - 1]
+                        + c as f32 * if c > 0 { acc.surface_area() } else { 0.0 };
                     if left_cnt[i - 1] > 0 && c > 0 && cost < best.0 {
                         best = (cost, axis, cb.min[axis] + i as f32 / scale);
                     }
@@ -140,7 +167,12 @@ impl Bvh {
                 if i == 0 || i == count { count / 2 } else { i }
             };
             let left = bvh.nodes.len();
-            bvh.nodes.push(Node { min: Vec3::ZERO, left_first: first as u32, max: Vec3::ZERO, count: mid as u32 });
+            bvh.nodes.push(Node {
+                min: Vec3::ZERO,
+                left_first: first as u32,
+                max: Vec3::ZERO,
+                count: mid as u32,
+            });
             bvh.nodes.push(Node {
                 min: Vec3::ZERO,
                 left_first: (first + mid) as u32,
@@ -159,8 +191,54 @@ impl Bvh {
         self.nodes.is_empty()
     }
 
+    /// Export immutable topology without exposing or changing the CPU traversal layout.
+    pub fn traversal_nodes(&self) -> Vec<TraversalNode> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+        enum Visit {
+            Node(u32),
+            End(usize),
+        }
+        let mut pending = vec![Visit::Node(0)];
+        let mut out: Vec<TraversalNode> = Vec::with_capacity(self.nodes.len());
+        while let Some(visit) = pending.pop() {
+            match visit {
+                Visit::End(index) => out[index].escape = out.len() as u32,
+                Visit::Node(index) => {
+                    let n = self.nodes[index as usize];
+                    let slot = out.len();
+                    out.push(TraversalNode {
+                        min: n.min,
+                        max: n.max,
+                        first: n.left_first,
+                        count: n.count,
+                        escape: slot as u32 + 1,
+                    });
+                    if n.count == 0 {
+                        pending.push(Visit::End(slot));
+                        pending.push(Visit::Node(n.left_first + 1));
+                        pending.push(Visit::Node(n.left_first));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Triangle references used by exported leaves. Borrowed, immutable, no mesh duplication.
+    pub fn triangle_order(&self) -> &[u32] {
+        &self.tri_ids
+    }
+
     pub fn bounds(&self) -> Aabb {
-        self.nodes.first().map(|n| Aabb { min: n.min, max: n.max }).unwrap_or(Aabb::EMPTY)
+        self.nodes
+            .first()
+            .map(|n| Aabb {
+                min: n.min,
+                max: n.max,
+            })
+            .unwrap_or(Aabb::EMPTY)
     }
 
     /// Closest intersection in `(t_min, t_max)`. Both triangle sides are hit.
@@ -192,7 +270,9 @@ impl Bvh {
                 continue;
             }
             if node.count > 0 {
-                for &t in &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize] {
+                for &t in
+                    &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize]
+                {
                     if !accept(t) {
                         continue;
                     }
@@ -204,7 +284,13 @@ impl Bvh {
             } else {
                 let l = node.left_first as usize;
                 let dl = slab(self.nodes[l].min, self.nodes[l].max, origin, inv, t_best);
-                let dr = slab(self.nodes[l + 1].min, self.nodes[l + 1].max, origin, inv, t_best);
+                let dr = slab(
+                    self.nodes[l + 1].min,
+                    self.nodes[l + 1].max,
+                    origin,
+                    inv,
+                    t_best,
+                );
                 match (dl, dr) {
                     (Some(a), Some(b)) => {
                         // Push far child first so the near one is processed next.
@@ -236,7 +322,14 @@ impl Bvh {
         best
     }
 
-    fn intersect_slow(&self, origin: Vec3, dir: Vec3, t_min: f32, t_max: f32, accept: &dyn Fn(u32) -> bool) -> Option<RayHit> {
+    fn intersect_slow(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        t_min: f32,
+        t_max: f32,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Option<RayHit> {
         let inv = dir.recip();
         let mut best: Option<RayHit> = None;
         let mut t_best = t_max;
@@ -247,7 +340,9 @@ impl Bvh {
                 continue;
             }
             if node.count > 0 {
-                for &t in &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize] {
+                for &t in
+                    &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize]
+                {
                     if accept(t)
                         && let Some(h) = self.tri_hit(t, origin, dir, t_min, t_best)
                     {
@@ -276,7 +371,9 @@ impl Bvh {
                 continue;
             }
             if node.count > 0 {
-                for &t in &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize] {
+                for &t in
+                    &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize]
+                {
                     if self.tri_hit(t, origin, dir, t_min, t_max).is_some() {
                         return true;
                     }
@@ -297,11 +394,16 @@ impl Bvh {
         let mut stack = vec![0u32];
         while let Some(ni) = stack.pop() {
             let node = &self.nodes[ni as usize];
-            if !test(&Aabb { min: node.min, max: node.max }) {
+            if !test(&Aabb {
+                min: node.min,
+                max: node.max,
+            }) {
                 continue;
             }
             if node.count > 0 {
-                for &t in &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize] {
+                for &t in
+                    &self.tri_ids[node.left_first as usize..(node.left_first + node.count) as usize]
+                {
                     visit(t);
                 }
             } else {
@@ -321,7 +423,11 @@ impl Bvh {
                 d.length_squared() <= r2
             },
             |t| {
-                let (a, b, c) = (self.v0[t as usize], self.v0[t as usize] + self.e1[t as usize], self.v0[t as usize] + self.e2[t as usize]);
+                let (a, b, c) = (
+                    self.v0[t as usize],
+                    self.v0[t as usize] + self.e1[t as usize],
+                    self.v0[t as usize] + self.e2[t as usize],
+                );
                 let tb = Aabb::from_points([a, b, c]);
                 let d = center.clamp(tb.min, tb.max) - center;
                 if d.length_squared() <= r2 {
@@ -356,7 +462,13 @@ impl Bvh {
         if dist <= t_min || dist >= t_max {
             return None;
         }
-        Some(RayHit { tri: t, t: dist, u, v, front_face: det > 0.0 })
+        Some(RayHit {
+            tri: t,
+            t: dist,
+            u,
+            v,
+            front_face: det > 0.0,
+        })
     }
 }
 
@@ -391,7 +503,9 @@ mod tests {
     #[test]
     fn matches_brute_force_on_sphere() {
         let mesh = primitives::uv_sphere(1.0, 32, 16);
-        let tris: Vec<[Vec3; 3]> = (0..mesh.triangle_count()).map(|t| mesh.tri_positions(t)).collect();
+        let tris: Vec<[Vec3; 3]> = (0..mesh.triangle_count())
+            .map(|t| mesh.tri_positions(t))
+            .collect();
         let bvh = Bvh::from_triangles(&tris);
         let mut seed = 12345u32;
         let mut rnd = || {
@@ -418,7 +532,9 @@ mod tests {
     fn ray_hits_sphere_at_radius() {
         let mesh = primitives::uv_sphere(1.0, 64, 32);
         let bvh = Bvh::build(&mesh);
-        let h = bvh.intersect(Vec3::new(0.0, 0.0, 5.0), -Vec3::Z, 0.0, 100.0).unwrap();
+        let h = bvh
+            .intersect(Vec3::new(0.0, 0.0, 5.0), -Vec3::Z, 0.0, 100.0)
+            .unwrap();
         assert!((h.t - 4.0).abs() < 0.01, "t={}", h.t);
         assert!(h.front_face);
         assert!(bvh.occluded(Vec3::new(0.0, 0.0, 5.0), -Vec3::Z, 0.0, 100.0));

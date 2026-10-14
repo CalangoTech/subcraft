@@ -1,6 +1,14 @@
-# SubCraft Studio 0.2.0-studio.1
+# SubCraft Studio 0.2.0-studio.2
 
 Fork de [Aalzard/subcraft](https://github.com/Aalzard/subcraft), a partir de `eb3f374`, mantido em [CalangoTech/subcraft](https://github.com/CalangoTech/subcraft/tree/codex/subcraft-studio). Mantém as licenças MIT/Apache-2.0 e os créditos originais.
+
+## Atualizacao do Bake Studio
+
+A versao studio.2 adiciona aba dedicada, previews reais progressivos, cage 3D, parametros por mapa e backend GPU compute. Veja [o guia e a validacao focada](BAKE_STUDIO.md). As medidas abaixo pertencem a entrega studio.1 e nao foram repetidas nesta atualizacao.
+
+## Atualizacao do Bake Studio
+
+A versao studio.2 adiciona aba dedicada, previews reais progressivos, cage 3D, parametros por mapa e backend GPU compute. Veja [o guia e a validacao focada](BAKE_STUDIO.md). As medidas da secao abaixo pertencem a entrega studio.1; nao foram repetidas indiscriminadamente nesta atualizacao.
 
 ## O que mudou
 
@@ -55,8 +63,8 @@ A interface nativa foi aberta pelo executável e capturada pelo próprio modo `-
 
 Lê projetos schema 1 e 2; novos projetos/fragmentos usam schema 3. Versões antigas do SubCraft recusam schema 3. Preserve seus projetos originais ao migrar.
 
-O limite de bake é 4096² **amostras**: resolução × fator por eixo ≤ 4096. Trabalhos próximos desse limite ainda podem consumir vários GB de RAM. Cancelamento é verificado em checkpoints; importação, BVH e dilatação podem demorar a terminar a etapa atual.
+O limite de bake é 4096² **amostras**: resolução × fator por eixo ≤ 4096. Trabalhos próximos desse limite podem exigir vários GB de RAM e são recusados se ultrapassarem o orçamento configurado. Cancelamento é verificado também durante rasterização, raios e padding; importação e construção da BVH ainda precisam terminar a etapa atual.
 
-É uma evolução funcional de um programa inicial. Clone/smudge, pintura direta no canvas 2D, UDIM, compositor/bake GPU e leitura nativa de SBSAR continuam fora desta versão. A interface principal mantém os termos técnicos em inglês; o guia rápido acompanha o pacote em português.
+É uma evolução funcional de um programa inicial. Clone/smudge, pintura direta no canvas 2D, UDIM, compositor GPU e leitura nativa de SBSAR continuam fora desta versão. A interface principal mantém os termos técnicos em inglês; o guia rápido acompanha o pacote em português.
 
 Clippy normal conclui; o código herdado ainda tem avisos de estilo sob Rust 1.99 e a dependência `nalgebra 0.26.2` gera um aviso de compatibilidade futura. Isso não impediu os testes nem o build otimizado.

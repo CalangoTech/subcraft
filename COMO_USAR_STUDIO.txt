@@ -10,19 +10,31 @@ O programa abre com uma caixa de exemplo. File > New from mesh importa OBJ,
 FBX, glTF ou GLB; File > Open project abre um arquivo .subcraft.
 O pacote tambem inclui Demo_Studio/Projeto_Demo_Studio.subcraft.
 
-BAKE SEM UV NO HIGH POLY
-1. Abra o LOW POLY com UVs. Essa malha recebe a pintura e continua precisando UV.
-2. Ctrl+B abre Bake. Selecione o arquivo HIGH POLY; ele pode nao ter UVs.
-3. Low e high devem estar alinhados, na mesma escala e no mesmo espaco.
-4. Ajuste as distancias Front/Rear da cage se os detalhes nao forem encontrados.
-5. Escolha mapas, resolucao, AO e amostras de thickness. Clique Bake.
-6. Confira mapas na aba 2D View. As smart masks de borda/cavidade usam esses mapas.
+BAKE STUDIO - PREVIA PROGRESSIVA, CAGE E GPU
+1. Abra o LOW POLY com UVs. Ctrl+B abre a aba Bake Studio.
+2. Escolha o HIGH POLY opcional; OBJ/FBX/glTF/GLB podem estar sem UVs.
+3. Low e high precisam estar alinhados, na mesma escala e no mesmo espaco.
+4. Configure resolucao, AA, mapas e os parametros de cada mapa.
+5. Em Cage 3D ajuste Frente/Tras e veja a projecao em wireframe.
+   Ciano = frente; laranja = tras. Arraste para orbitar, meio para mover,
+   roda para zoom. Enquadrar inclui a cage. A visualizacao simplifica o
+   wireframe em malhas grandes; o bake usa a malha completa.
+6. Auto tenta GPU e informa se precisar CPU. GPU exige hardware compativel;
+   erros sao exibidos, sem troca silenciosa. CPU usa o limite de threads.
+7. Iniciar bake mostra texturas reais sendo calculadas, mapa, etapa, conjunto,
+   tempo e progresso. Seguir mapa atual alterna a previa automaticamente.
+   As miniaturas deixam consultar outros mapas. Cancelar interrompe nos
+   checkpoints; importacao/BVH ainda precisam terminar sua etapa.
 
-Anti-aliasing: 1 amostra por pixel, 4 amostras (2x2) ou 16 (4x4).
-Mais amostras custam mais tempo e memoria. Resolucao x fator por eixo <=4096.
-No limite 4096x4096 de amostras, o bake pode consumir varios GB de RAM.
-O cancelamento acontece em checkpoints; importacao/BVH/padding podem levar
-algum tempo para devolver o controle ao job. O trabalho acontece em background.
+Compute GPU acelera projecao e calculo dos sete mapas. Importacao, UVs,
+BVH, padding e aplicacao final continuam usando CPU. Nao exige CUDA/RTX.
+Threads CPU = 0 usa metade dos processadores logicos, no maximo 4 workers.
+RAM padrao = 1536 MiB para buffers estimados; malhas/BVH/driver sao adicionais.
+Lotes GPU pequenos, limite de memoria e esperas finitas protegem o fluxo;
+nenhum programa pode garantir ausencia de falhas de driver/tela azul.
+AA: 1, 4 (2x2) ou 16 (4x4) amostras por pixel. Resolucao x fator <=4096.
+Trabalhos acima do orcamento sao recusados antes dos grandes buffers.
+Detalhes, limites e validacao desta atualizacao: docs/BAKE_STUDIO.md.
 
 CAMADAS E PASTAS
 Use os botoes em Layers para paint layer, fill layer e pasta.
@@ -83,7 +95,7 @@ COMPATIBILIDADE E LIMITES DESTA VERSAO
 Le projetos antigos schema 1/2. Novos projetos usam schema 3 para filtros e locks.
 Versoes antigas do programa nao abrem schema 3: preserve os seus originais.
 Esta e uma evolucao funcional do SubCraft, ainda sem equivalencia completa com
-Substance Painter. Clone/smudge, pintura direta 2D, UDIM e compositor/bake GPU
+Substance Painter. Clone/smudge, pintura direta 2D, UDIM e compositor GPU
 ainda nao estao implementados. A interface principal preserva termos em ingles.
 
 CODIGO E VALIDACAO

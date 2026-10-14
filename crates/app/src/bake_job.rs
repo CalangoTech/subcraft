@@ -4,10 +4,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 
-use subcraft_bake::{BakeInput, BakeSettings, Geometry, Progress, bake};
+use subcraft_bake::{
+    BakeBackend, BakeInput, BakePreview, BakeSettings, CpuBakeBackend, Geometry, Progress,
+    ProgressSnapshot,
+};
 use subcraft_core::{MeshMapKind, TextureSetId};
 use subcraft_image::TiledImage;
 use subcraft_mesh::{Bvh, Mesh, import_high_poly};
@@ -35,6 +38,7 @@ pub struct BakeJob {
     sets_done: Arc<AtomicUsize>,
     sets_total: usize,
     stage: Arc<Mutex<String>>,
+    current_set: Arc<Mutex<Option<TextureSetId>>>,
     rx: Receiver<Message>,
     applied: usize,
     error: Option<String>,
@@ -42,14 +46,36 @@ pub struct BakeJob {
 
 impl BakeJob {
     pub(crate) fn start(low: Arc<Mesh>, low_bvh: Arc<Bvh>, request: BakeRequest) -> Self {
-        let (tx, rx) = channel();
+        Self::start_with_backend(low, low_bvh, request, Arc::new(CpuBakeBackend))
+    }
+
+    pub(crate) fn start_with_backend(
+        low: Arc<Mesh>,
+        low_bvh: Arc<Bvh>,
+        request: BakeRequest,
+        backend: Arc<dyn BakeBackend>,
+    ) -> Self {
+        // A busy/minimized UI must not let completed texture sets accumulate without bound.
+        let (tx, rx) = sync_channel(1);
         let sets_total = request.texture_sets.len();
         let progress = Arc::new(Progress::new());
+        progress.set_backend(backend.name());
         let sets_done = Arc::new(AtomicUsize::new(0));
-        let stage = Arc::new(Mutex::new("Starting".to_string()));
-        let (p, done, st) = (progress.clone(), sets_done.clone(), stage.clone());
+        let stage = Arc::new(Mutex::new("Preparando bake".to_string()));
+        let current_set = Arc::new(Mutex::new(None));
+        let (p, done, st, current) = (
+            progress.clone(),
+            sets_done.clone(),
+            stage.clone(),
+            current_set.clone(),
+        );
         subcraft_core::task::spawn(move || {
             if let Err(error) = request.settings.validate() {
+                let _ = tx.send(Message::Failed(error.to_string()));
+                let _ = tx.send(Message::Finished);
+                return;
+            }
+            if let Err(error) = request.settings.validate_memory_budget() {
                 let _ = tx.send(Message::Failed(error.to_string()));
                 let _ = tx.send(Message::Finished);
                 return;
@@ -64,7 +90,7 @@ impl BakeJob {
             let high = match &request.high_poly {
                 Some(path) => {
                     *st.lock().expect("stage lock") =
-                        format!("Loading high poly {}", path.display());
+                        format!("Importando high poly {}", path.display());
                     match import_high_poly(path) {
                         Ok(r) => {
                             if p.is_cancelled() {
@@ -72,7 +98,7 @@ impl BakeJob {
                                 let _ = tx.send(Message::Finished);
                                 return;
                             }
-                            *st.lock().expect("stage lock") = "Building high-poly BVH".into();
+                            *st.lock().expect("stage lock") = "Construindo BVH do high poly".into();
                             let bvh = Bvh::build(&r.mesh);
                             Some((r.mesh, bvh))
                         }
@@ -91,10 +117,11 @@ impl BakeJob {
                     break;
                 }
                 *st.lock().expect("stage lock") = format!(
-                    "Baking texture set {}/{}",
+                    "Conjunto de texturas {}/{}",
                     i + 1,
                     request.texture_sets.len()
                 );
+                *current.lock().expect("current texture set lock") = Some(*ts);
                 let input = BakeInput {
                     low: Geometry {
                         mesh: &low,
@@ -103,9 +130,12 @@ impl BakeJob {
                     high: high.as_ref().map(|(m, b)| Geometry { mesh: m, bvh: b }),
                     material_slot: *slot,
                 };
-                match bake(&input, &request.settings, &p) {
+                p.set_backend(backend.name());
+                match backend.bake(&input, &request.settings, &p) {
                     Ok(maps) => {
-                        let _ = tx.send(Message::Baked(*ts, maps));
+                        if tx.send(Message::Baked(*ts, maps)).is_err() {
+                            return;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Message::Failed(e.to_string()));
@@ -115,7 +145,9 @@ impl BakeJob {
                     }
                 }
                 done.fetch_add(1, Ordering::Relaxed);
-                p.reset_fraction();
+                if i + 1 < request.texture_sets.len() {
+                    p.reset_fraction();
+                }
             }
             let _ = tx.send(Message::Finished);
         });
@@ -124,6 +156,7 @@ impl BakeJob {
             sets_done,
             sets_total,
             stage,
+            current_set,
             rx,
             applied: 0,
             error: None,
@@ -138,7 +171,33 @@ impl BakeJob {
     }
 
     pub fn stage(&self) -> String {
-        self.stage.lock().map(|s| s.clone()).unwrap_or_default()
+        let stage = self.stage.lock().map(|s| s.clone()).unwrap_or_default();
+        let snapshot = self.progress.snapshot();
+        if let Some(kind) = snapshot.map {
+            format!(
+                "{stage} · {} ({}/{}) · {} · {}",
+                kind.display_name(),
+                snapshot.map_index,
+                snapshot.maps_total,
+                snapshot.phase.label(),
+                snapshot.backend
+            )
+        } else {
+            format!("{stage} · {}", snapshot.phase.label())
+        }
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        self.progress.snapshot()
+    }
+    pub fn previews(&self) -> Vec<Arc<BakePreview>> {
+        self.progress.previews()
+    }
+    pub fn current_texture_set(&self) -> Option<TextureSetId> {
+        self.current_set.lock().ok().and_then(|set| *set)
+    }
+    pub fn texture_sets_progress(&self) -> (usize, usize) {
+        (self.sets_done.load(Ordering::Relaxed), self.sets_total)
     }
 
     pub fn cancel(&self) {
@@ -170,5 +229,11 @@ impl BakeJob {
                 Err(TryRecvError::Empty) => return None,
             }
         }
+    }
+}
+
+impl Drop for BakeJob {
+    fn drop(&mut self) {
+        self.progress.cancel();
     }
 }

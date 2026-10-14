@@ -9,6 +9,20 @@ use crate::icons;
 use crate::state::{Tool, UiState};
 use crate::theme::{self, ACCENT};
 
+pub fn show_bake_cage(state: &mut UiState, ui: &mut Ui) {
+    let mesh = state.session.scene().mesh.clone();
+    let options = crate::bake_view::CageOptions {
+        front: state.bake.settings.cage_front,
+        rear: state.bake.settings.cage_rear,
+        opacity: state.bake.cage_opacity,
+        show_low: state.bake.cage_show_low,
+        show_front: state.bake.cage_show_front,
+        show_rear: state.bake.cage_show_rear,
+        slot: (!state.bake.all_sets).then(|| state.session.selected_texture_set().material_slot),
+    };
+    state.bake_cage.show(ui, &mesh, state.render_state.as_ref(), state.session_generation, options);
+}
+
 /// Text on a translucent dark plate, anchored at `pos`; returns the plate rect.
 fn pill(
     painter: &egui::Painter,

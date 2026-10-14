@@ -24,6 +24,7 @@ use crate::{icons, panels, theme};
 pub enum Tab {
     Viewport,
     UvView,
+    Bake,
     Layers,
     Properties,
     Brush,
@@ -37,6 +38,7 @@ impl Tab {
         match self {
             Tab::Viewport => "3D View",
             Tab::UvView => "2D View",
+            Tab::Bake => "Bake Studio",
             Tab::Layers => "Layers",
             Tab::Properties => "Properties",
             Tab::Brush => "Brush",
@@ -50,6 +52,7 @@ impl Tab {
         match self {
             Tab::Viewport => icons::CUBE,
             Tab::UvView => icons::GRID,
+            Tab::Bake => icons::MAGIC_WAND,
             Tab::Layers => icons::STACK,
             Tab::Properties => icons::SLIDERS,
             Tab::Brush => icons::PAINT_BRUSH,
@@ -71,10 +74,18 @@ pub struct LaunchOptions {
     pub screenshot: Option<PathBuf>,
     /// Start with the 2D (UV) view in front.
     pub view_2d: bool,
+    /// Show the dedicated bake workspace on startup.
+    pub bake_view: bool,
+    /// Start a conservative sample bake for visual smoke validation.
+    pub bake_demo: bool,
+    /// With a screenshot, wait for all demo maps and texture sets to be installed.
+    pub bake_demo_final: bool,
+    /// Show the 3D cage in the bake workspace.
+    pub cage_view: bool,
 }
 
 pub fn default_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Viewport, Tab::UvView]);
+    let mut dock = DockState::new(vec![Tab::Viewport, Tab::UvView, Tab::Bake]);
     let surface = dock.main_surface_mut();
     let [center, right] = surface.split_right(NodeIndex::root(), 0.74, vec![Tab::Layers]);
     surface.split_below(right, 0.4, vec![Tab::Properties, Tab::Brush]);
@@ -84,10 +95,19 @@ pub fn default_layout() -> DockState<Tab> {
     dock
 }
 
+// Migrate saved workspaces without losing the user's tab arrangement.
+fn ensure_bake_tab(dock: &mut DockState<Tab>) {
+    if dock.find_tab(&Tab::Bake).is_some() { return; }
+    if let Some(path) = dock.find_tab(&Tab::Viewport).or_else(|| dock.find_tab(&Tab::UvView)) {
+        dock.set_focused_node_and_surface(path.node_path());
+    }
+    dock.push_to_focused_leaf(Tab::Bake);
+}
+
 const DOCK_KEY: &str = "subcraft_studio_dock_v4";
 
 pub fn split_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Viewport]);
+    let mut dock = DockState::new(vec![Tab::Viewport, Tab::Bake]);
     let tree = dock.main_surface_mut();
     let [center, right] = tree.split_right(
         NodeIndex::root(),
@@ -101,7 +121,7 @@ pub fn split_layout() -> DockState<Tab> {
 }
 
 pub fn paint_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Viewport, Tab::UvView]);
+    let mut dock = DockState::new(vec![Tab::Viewport, Tab::UvView, Tab::Bake]);
     let tree = dock.main_surface_mut();
     let [center, right] = tree.split_right(
         NodeIndex::root(),
@@ -119,6 +139,8 @@ pub struct SubcraftApp {
     frames: u64,
     screenshot: Option<PathBuf>,
     screenshot_requested: bool,
+    screenshot_bake: bool,
+    screenshot_bake_final: bool,
     /// Action approved this frame, run after the UI pass.
     pending_now: Option<Pending>,
     /// Tabs whose body was shown last frame (drawn with the accent marker).
@@ -195,10 +217,17 @@ impl SubcraftApp {
             .filter(|_| options.screenshot.is_none())
             .unwrap_or_else(paint_layout);
         let mut dock = dock;
+        ensure_bake_tab(&mut dock);
         if options.view_2d
             && let Some(path) = dock.find_tab(&Tab::UvView)
         {
             let _ = dock.set_active_tab(path);
+        }
+        if options.bake_view || options.bake_demo || options.cage_view {
+            if let Some(path) = dock.find_tab(&Tab::Bake) { let _ = dock.set_active_tab(path); }
+            state.bake.view_cage = options.cage_view;
+            if options.cage_view { state.bake.settings.cage_front = 0.04; state.bake.settings.cage_rear = 0.02; }
+            if options.bake_demo { state.bake.settings.size = 256; dialogs::start_bake(&mut state, 0.0); }
         }
         Self {
             state,
@@ -206,8 +235,10 @@ impl SubcraftApp {
             frames: 0,
             screenshot: options.screenshot,
             screenshot_requested: false,
+            screenshot_bake: options.bake_demo,
+            screenshot_bake_final: options.bake_demo_final,
             pending_now: None,
-            active_tabs: HashSet::new(),
+            active_tabs: if options.bake_view || options.bake_demo || options.cage_view { HashSet::from([Tab::Bake]) } else { HashSet::new() },
             preferences,
             recovery: Default::default(),
             last_project: None,
@@ -278,7 +309,7 @@ impl SubcraftApp {
                 dialogs::save(&mut self.state, true, now);
             }
             Action::OpenProject => self.request(Pending::OpenProject, now),
-            Action::Bake => self.state.bake.open = true,
+            Action::Bake => self.focus_bake(),
             Action::Export => {
                 self.state.export.open = true;
                 self.state.export.settings.height_to_normal = self.state.height_scale;
@@ -289,6 +320,14 @@ impl SubcraftApp {
                 }
             }
         }
+    }
+
+    fn focus_bake(&mut self) {
+        ensure_bake_tab(&mut self.dock);
+        if let Some(path) = self.dock.find_tab(&Tab::Bake) { let _ = self.dock.set_active_tab(path); }
+        self.state.bake.open = false;
+        self.state.bake.maximized = true;
+        self.active_tabs.insert(Tab::Bake);
     }
 
     /// Top bar: brand, menus, project name, then undo/redo and the main actions on the right.
@@ -733,7 +772,13 @@ impl SubcraftApp {
             return;
         };
         ctx.request_repaint();
-        if !self.screenshot_requested && self.frames >= 20 {
+        let bake_ready = (if self.screenshot_bake_final { self.state.bake.job.is_none() }
+            else { !self.screenshot_bake
+            || (self.state.bake.job.is_none() && !self.state.bake.preview_textures.is_empty())
+            || (self.state.bake.current_map == Some(subcraft_core::MeshMapKind::AmbientOcclusion)
+                && self.state.bake.map_fraction > 0.1 && !self.state.bake.preview_textures.is_empty()) })
+            || self.state.bake.elapsed_seconds > 30.0;
+        if !self.screenshot_requested && self.frames >= 20 && bake_ready {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             self.screenshot_requested = true;
         }
@@ -841,6 +886,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
         match tab {
             Tab::Viewport => crate::viewport::show(self.state, ui),
             Tab::UvView => panels::uv_view::show(self.state, ui),
+            Tab::Bake => { let now = ui.input(|i| i.time); panels::baking::show(self.state, ui, now); }
             Tab::Layers => panels::layers::show(self.state, ui),
             Tab::Properties => panels::properties::show(self.state, ui),
             Tab::Brush => panels::brush::show(self.state, ui),
@@ -884,17 +930,31 @@ impl eframe::App for SubcraftApp {
             .show_separator_line(false)
             .frame(bar(theme::BG_2))
             .show(ui, |ui| self.header_bar(ui));
+        let bake_mode = self.state.bake.maximized && self.active_tabs.contains(&Tab::Bake);
         egui::Panel::top("context-tools")
             .exact_size(36.0)
             .show_separator_line(false)
             .frame(bar(theme::BG_1))
-            .show(ui, |ui| self.context_bar(ui));
+            .show(ui, |ui| {
+                if bake_mode {
+                    ui.horizontal(|ui| {
+                        if secondary_button(ui, "← Voltar à pintura").clicked() {
+                            self.state.bake.maximized = false;
+                            if let Some(path) = self.dock.find_tab(&Tab::Viewport) { let _ = self.dock.set_active_tab(path); }
+                            ui.ctx().request_repaint();
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Bake Studio").strong());
+                        ui.label(egui::RichText::new("Mapas progressivos · cage · GPU compute").small().color(theme::TEXT_DIM));
+                    });
+                } else { self.context_bar(ui); }
+            });
         egui::Panel::bottom("status")
             .exact_size(26.0)
             .show_separator_line(false)
             .frame(bar(theme::BG_0))
             .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("tools")
+        if !bake_mode { egui::Panel::left("tools")
             .exact_size(48.0)
             .resizable(false)
             .show_separator_line(false)
@@ -903,7 +963,7 @@ impl eframe::App for SubcraftApp {
                     .fill(theme::BG_2)
                     .inner_margin(egui::Margin::symmetric(4, 0)),
             )
-            .show(ui, |ui| self.tool_rail(ui));
+            .show(ui, |ui| self.tool_rail(ui)); }
         let style = theme::dock_style(ui.style());
         let mut viewer = Viewer {
             state: &mut self.state,
@@ -919,6 +979,12 @@ impl eframe::App for SubcraftApp {
                 bottom: 0,
             })
             .show(ui, |ui| {
+                if bake_mode {
+                    viewer.active.insert(Tab::Bake);
+                    let now = ui.input(|i| i.time);
+                    panels::baking::show(viewer.state, ui, now);
+                    return;
+                }
                 DockArea::new(&mut self.dock)
                     .style(style)
                     .show_close_buttons(false)
@@ -946,7 +1012,7 @@ impl eframe::App for SubcraftApp {
                 .poll(&mut self.state, &self.preferences, &ctx, now);
         }
         dialogs::export_window(&mut self.state, &ctx, now);
-        dialogs::bake_window(&mut self.state, &ctx, now);
+        if self.state.bake.open { self.focus_bake(); ctx.request_repaint(); }
         dialogs::poll_bake(&mut self.state, &ctx, now);
         crate::files::poll(&mut self.state, now);
         if let Some(action) = dialogs::unsaved_prompt(&mut self.state, &ctx, now) {

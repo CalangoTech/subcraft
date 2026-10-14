@@ -4,6 +4,8 @@ This is the **CalangoTech Studio fork** of [Aalzard/SubCraft](https://github.com
 
 Studio adds UV-free high-poly bake import (OBJ/FBX/glTF/GLB), supersampled bakes, draggable and lockable layer trees, inline renaming, spatial mask filters, additional smart assets, material eyedropping, solo-channel inspection, orthographic viewing, workspace presets and background recovery saves. Idle CPU/GPU work is reduced through revision tracking, tile upload snapshots and cached previews. Viewport quality is adjustable independently of texture resolution.
 
+Bake Studio now provides a dedicated tab with real progressive texture previews, per-map settings and an interactive 3D projection cage. Its hardware compute backend evaluates all seven maps on the GPU; UV preparation and padding remain on a limited CPU pool. Auto/GPU/CPU selection, allocation guards and bounded GPU jobs are documented in [the bake guide](docs/BAKE_STUDIO.md).
+
 See [the Studio guide and validation](docs/STUDIO.md) or [the Portuguese quick start](COMO_USAR_STUDIO.txt). This remains an early open-source texture painter; full Substance Painter feature parity is not claimed.
 
 ![SubCraft Studio workspace](docs/screenshots/studio-main.png)

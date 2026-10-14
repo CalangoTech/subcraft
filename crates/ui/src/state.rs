@@ -75,6 +75,8 @@ pub struct UiState {
     pub allow_close: bool,
     pub last_title: String,
     pub bake: crate::dialogs::BakeUi,
+    pub bake_cage: crate::bake_view::CageViewport,
+    pub(crate) bake_backends: crate::bake_backend::BakeBackends,
     pub uv_wireframe: bool,
     pub library: subcraft_app::assets::Library,
     pub shelf: crate::panels::shelf::ShelfUi,
@@ -153,6 +155,8 @@ impl UiState {
             allow_close: false,
             last_title: String::new(),
             bake: Default::default(),
+            bake_cage: Default::default(),
+            bake_backends: Default::default(),
             uv_wireframe: true,
             library: subcraft_app::assets::Library::builtin(),
             shelf: Default::default(),
@@ -244,6 +248,8 @@ impl UiState {
 
     /// Replace the session (new project / opened mesh).
     pub fn set_session(&mut self, mut session: Session) {
+        if let Some(job) = self.bake.job.take() { job.cancel(); }
+        self.bake = Default::default();
         session.brush.material = self.session.brush.material.clone();
         self.camera = OrbitCamera::framing(&session.scene().mesh.bounds);
         self.session = session;

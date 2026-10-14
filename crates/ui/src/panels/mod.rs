@@ -1,3 +1,4 @@
+pub mod baking;
 pub mod brush;
 pub mod history;
 pub mod layers;

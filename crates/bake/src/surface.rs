@@ -3,7 +3,7 @@
 use glam::{Vec2, Vec3, Vec4};
 use subcraft_core::IRect;
 use subcraft_mesh::Mesh;
-use subcraft_mesh::uv_raster::raster_triangle;
+use subcraft_mesh::uv_raster::{raster_triangle, triangle_rect};
 
 /// Rim (texels) baked around islands so bilinear filtering never reads unbaked gutter.
 pub const BAKE_EXPAND: f32 = 1.0;
@@ -42,34 +42,52 @@ pub fn texels_cancellable(
             return None;
         }
         let uv: [Vec2; 3] = mesh.tri_uvs(t);
-        raster_triangle(uv, size, size, full, BAKE_EXPAND, |h| {
-            let i = (h.y as u32 * size + h.x as u32) as usize;
-            let d = h.distance.max(0.0);
-            if d < best[i].0 {
-                best[i] = (d, t as u32, h.bary);
+        let rect = triangle_rect(uv, size, size, BAKE_EXPAND).intersect(&full);
+        // Large UV triangles can cover millions of pixels. Clip in short strips to make
+        // cancellation responsive even during rasterization of one triangle.
+        for y in (rect.y0..rect.y1).step_by(16) {
+            if cancelled() {
+                return None;
             }
-        });
+            let clip = IRect::new(rect.x0, y, rect.x1, (y + 16).min(rect.y1));
+            raster_triangle(uv, size, size, clip, BAKE_EXPAND, |h| {
+                let i = (h.y as u32 * size + h.x as u32) as usize;
+                let d = h.distance.max(0.0);
+                if d < best[i].0 {
+                    best[i] = (d, t as u32, h.bary);
+                }
+            });
+        }
     }
     if cancelled() {
         return None;
     }
-    Some(
-        best.iter()
-            .enumerate()
-            .filter(|(_, b)| b.1 != u32::MAX)
-            .map(|(i, &(_, tri, bary))| {
-                let sp = mesh.interpolate(tri as usize, bary[1], bary[2]);
-                Texel {
-                    index: i as u32,
-                    tri,
-                    position: sp.position,
-                    normal: sp.normal,
-                    tangent: sp.tangent,
-                    geometric_normal: sp.geometric_normal,
-                }
-            })
-            .collect(),
-    )
+    let covered_count = best.iter().filter(|b| b.1 != u32::MAX).count();
+    let mut output = Vec::with_capacity(covered_count);
+    for (start, chunk) in best.chunks(4096).enumerate() {
+        if cancelled() {
+            return None;
+        }
+        output.extend(
+            chunk
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.1 != u32::MAX)
+                .map(|(i, &(_, tri, bary))| {
+                    let i = start * 4096 + i;
+                    let sp = mesh.interpolate(tri as usize, bary[1], bary[2]);
+                    Texel {
+                        index: i as u32,
+                        tri,
+                        position: sp.position,
+                        normal: sp.normal,
+                        tangent: sp.tangent,
+                        geometric_normal: sp.geometric_normal,
+                    }
+                }),
+        );
+    }
+    Some(output)
 }
 
 /// Deterministic per-texel random number in [0, 1).

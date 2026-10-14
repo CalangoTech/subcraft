@@ -37,6 +37,9 @@ pollster.workspace = true
 [dev-dependencies]
 subcraft-mesh.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+subcraft-bake-gpu.workspace = true
+
 # Web build: browser canvas, uploads and downloads.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.106"

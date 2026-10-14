@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "tools/*"]
 default-members = ["apps/subcraft"]
 
 [workspace.package]
-version = "0.2.0-studio.1"
+version = "0.2.0-studio.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -20,6 +20,7 @@ subcraft-materials = { path = "crates/materials" }
 subcraft-compositor = { path = "crates/compositor" }
 subcraft-paint = { path = "crates/paint" }
 subcraft-bake = { path = "crates/bake" }
+subcraft-bake-gpu = { path = "crates/bake-gpu" }
 subcraft-project = { path = "crates/project" }
 subcraft-export = { path = "crates/export" }
 subcraft-assets = { path = "crates/assets" }

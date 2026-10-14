@@ -63,7 +63,8 @@ try {
     $studioDocs = Join-Path $stage 'docs'
     New-Item -ItemType Directory -Path (Join-Path $studioDocs 'screenshots') -Force | Out-Null
     Copy-Item 'docs\STUDIO.md' $studioDocs
-    Copy-Item 'docs\screenshots\studio-main.png' (Join-Path $studioDocs 'screenshots')
+    if (Test-Path -LiteralPath 'docs\BAKE_STUDIO.md') { Copy-Item 'docs\BAKE_STUDIO.md' $studioDocs }
+    Copy-Item @('docs\screenshots\studio-main.png', 'docs\screenshots\bake-studio.png', 'docs\screenshots\bake-cage.png') (Join-Path $studioDocs 'screenshots')
 
     # Do not package Recovery or projects the user saved alongside the portable exe.
     $packageItems = @($outExe, 'README.md', 'COMO_USAR_STUDIO.txt', 'LICENSE-MIT', 'LICENSE-APACHE', 'PORTABLE', 'third-party', 'Demo_Studio', 'docs') |

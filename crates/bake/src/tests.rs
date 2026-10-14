@@ -322,7 +322,9 @@ fn id_colors_differ_per_element_and_cancel_stops() {
 fn high_poly_file_without_uvs_transfers_normal_detail() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../mesh/tests/fixtures/high-poly-no-uv.obj");
-    let high = subcraft_mesh::import_high_poly(&path).unwrap().mesh;
+    let mut high = subcraft_mesh::import_high_poly(&path).unwrap().mesh;
+    high.uvs.clear();
+    high.tangents.clear();
     let low = primitives::plane(2.0, 1);
     let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
     let input = BakeInput {
@@ -428,9 +430,14 @@ fn supersampling_preserves_flat_normals_and_categorical_ids() {
         );
     }
     let ids = maps[&MeshMapKind::Id].to_dense();
-    assert!(ids.as_chunks::<3>().0.iter().all(|p| (p[0] - 0.9).abs() < 0.002
-        && (p[1] - 0.315).abs() < 0.002
-        && (p[2] - 0.315).abs() < 0.002));
+    assert!(
+        ids.as_chunks::<3>()
+            .0
+            .iter()
+            .all(|p| (p[0] - 0.9).abs() < 0.002
+                && (p[1] - 0.315).abs() < 0.002
+                && (p[2] - 0.315).abs() < 0.002)
+    );
     assert_eq!(progress.fraction(), 1.0);
 }
 
@@ -539,4 +546,152 @@ fn invalid_settings_fail_before_allocating() {
             Err(BakeError::InvalidSettings(_))
         ));
     }
+}
+
+#[test]
+fn progress_bounds_previews_and_keeps_only_latest_frames() {
+    let progress = Progress::new();
+    progress.begin(100);
+    progress.set_backend("Test compute adapter");
+    progress.set_map(MeshMapKind::Normal, 1, 2);
+    progress.set_map_work(50);
+    progress.advance(25);
+    assert!(progress.publish_preview(MeshMapKind::Normal, 1, 1, vec![1, 2, 3, 255], false));
+    assert!(!progress.publish_preview(MeshMapKind::Normal, 1, 1, vec![4, 5, 6, 255], false));
+    assert!(!progress.publish_preview(MeshMapKind::Normal, 513, 1, vec![0; 513 * 4], true));
+    assert!(!progress.publish_preview(MeshMapKind::Normal, 1, 1, vec![0; 3], true));
+    for n in 0..100 {
+        assert!(progress.publish_preview(MeshMapKind::Normal, 1, 1, vec![n, 0, 0, 255], true));
+    }
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.map, Some(MeshMapKind::Normal));
+    assert_eq!((snapshot.map_index, snapshot.maps_total), (1, 2));
+    assert_eq!(snapshot.backend, "Test compute adapter");
+    assert_eq!(snapshot.fraction, 0.25);
+    assert_eq!(snapshot.map_fraction, 0.5);
+    assert_eq!(snapshot.preview.unwrap().rgba, vec![99, 0, 0, 255]);
+    assert_eq!(
+        progress.previews().len(),
+        1,
+        "updates replace frames instead of queuing"
+    );
+    progress.set_map(MeshMapKind::Id, 2, 2);
+    progress.publish_preview(MeshMapKind::Id, 1, 1, vec![3; 4], true);
+    assert_eq!(
+        progress.previews().len(),
+        2,
+        "completed map previews remain available"
+    );
+    progress.cancel();
+    progress.begin(100);
+    assert!(
+        progress.is_cancelled(),
+        "a new texture set cannot clear cancellation"
+    );
+    assert!(progress.previews().is_empty());
+}
+
+#[test]
+fn cpu_limits_and_budget_are_applied_before_rasterization() {
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let settings = BakeSettings::default();
+    assert_eq!(settings.cpu_worker_count(), (available / 2).clamp(1, 4));
+    assert_eq!(
+        BakeSettings {
+            cpu_threads: 1,
+            ..settings.clone()
+        }
+        .cpu_worker_count(),
+        1
+    );
+    let low = primitives::plane(2.0, 1);
+    let bvh = Bvh::build(&low);
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &bvh,
+        },
+        high: None,
+        material_slot: 0,
+    };
+    let settings = BakeSettings {
+        size: 4096,
+        memory_limit_mb: 64,
+        ..settings
+    };
+    let progress = Progress::new();
+    assert!(matches!(
+        bake(&input, &settings, &progress),
+        Err(BakeError::MemoryBudget { .. })
+    ));
+    assert_eq!(progress.fraction(), 0.0);
+    assert!(progress.previews().is_empty());
+}
+
+#[test]
+fn preview_contains_actual_finished_texture_and_normal_convention() {
+    let low = primitives::plane(2.0, 1);
+    let high = bumped_plane();
+    let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &lb,
+        },
+        high: Some(Geometry {
+            mesh: &high,
+            bvh: &hb,
+        }),
+        material_slot: 0,
+    };
+    let mut settings = BakeSettings {
+        size: 32,
+        maps: vec![MeshMapKind::Normal],
+        cage_front: 0.1,
+        ..Default::default()
+    };
+    let progress = Progress::new();
+    let gl = bake(&input, &settings, &progress).unwrap();
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.phase, BakePhase::Completed);
+    assert_eq!(snapshot.map_fraction, 1.0);
+    let preview = snapshot.preview.unwrap();
+    assert_eq!((preview.width, preview.height), (32, 32));
+    let normal = &gl[&MeshMapKind::Normal];
+    for y in 0..32 {
+        for x in 0..32 {
+            let pixel = normal.get(x, y);
+            let offset = ((y * 32 + x) * 4) as usize;
+            for (c, &value) in pixel[..3].iter().enumerate() {
+                assert!((preview.rgba[offset + c] as f32 / 255.0 - value).abs() < 0.003);
+            }
+        }
+    }
+    settings.normal_flip_y = true;
+    let dx = bake(&input, &settings, &Progress::new()).unwrap();
+    assert!(
+        normal
+            .to_dense()
+            .chunks_exact(3)
+            .any(|p| (p[1] - 0.5).abs() > 0.05)
+    );
+    for (a, b) in normal
+        .to_dense()
+        .chunks_exact(3)
+        .zip(dx[&MeshMapKind::Normal].to_dense().chunks_exact(3))
+    {
+        assert!((a[0] - b[0]).abs() < 0.002 && (a[1] + b[1] - 1.0).abs() < 0.002);
+    }
+}
+
+#[test]
+fn uv_preparation_can_cancel_inside_a_single_large_triangle() {
+    let mesh = primitives::plane(2.0, 1);
+    let calls = std::cell::Cell::new(0);
+    let result = surface::texels_cancellable(&mesh, 0, 128, || {
+        calls.set(calls.get() + 1);
+        calls.get() > 4
+    });
+    assert!(result.is_none());
+    assert!(calls.get() > 4);
 }

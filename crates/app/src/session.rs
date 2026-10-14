@@ -266,6 +266,14 @@ impl Session {
         )
     }
 
+    /// Run a front-end supplied backend (for example a compute GPU) on a background thread.
+    pub fn start_bake_with_backend(&self, request: crate::bake_job::BakeRequest,
+        backend: Arc<dyn subcraft_bake::BakeBackend>) -> crate::bake_job::BakeJob {
+        crate::bake_job::BakeJob::start_with_backend(
+            self.scene.mesh.clone(), Arc::new(self.scene.bvh.clone()), request, backend,
+        )
+    }
+
     /// The built-in two-material sample crate.
     pub fn sample() -> Self {
         Self::new(primitives::sample_crate(), DEFAULT_RESOLUTION)

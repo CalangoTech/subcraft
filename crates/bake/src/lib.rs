@@ -12,17 +12,20 @@
 //! island texel.
 
 pub mod curvature;
+mod padding;
+mod progress;
 pub mod surface;
 
+pub use padding::dilate_cancellable;
+pub use progress::{BakePhase, BakePreview, Progress, ProgressSnapshot};
+
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use glam::Vec3;
 use rayon::prelude::*;
 use subcraft_core::MeshMapKind;
 use subcraft_core::color::hsv_to_rgb;
 use subcraft_image::TiledImage;
-use subcraft_image::dilate::dilate_infinite;
 use subcraft_mesh::{Bvh, Mesh, topology};
 
 use surface::{Texel, cosine_directions, hash01, texels_cancellable};
@@ -44,6 +47,16 @@ pub struct BakeSettings {
     /// High-poly projection cage above / below the low poly, fractions of the diagonal.
     pub cage_front: f32,
     pub cage_rear: f32,
+    /// 0 chooses half the available logical processors, capped at four workers.
+    pub cpu_threads: u32,
+    /// Conservative peak allocation budget, checked before rasterizing UVs.
+    pub memory_limit_mb: u32,
+    /// Ray-origin offset as a fraction of the geometry diagonal.
+    pub ray_bias: f32,
+    /// DirectX normal convention; otherwise OpenGL (+Y).
+    pub normal_flip_y: bool,
+    /// Changes the categorical mesh-element palette deterministically.
+    pub id_seed: u32,
 }
 
 impl Default for BakeSettings {
@@ -59,6 +72,11 @@ impl Default for BakeSettings {
             curvature_radius: 0.02,
             cage_front: 0.01,
             cage_rear: 0.01,
+            cpu_threads: 0,
+            memory_limit_mb: 1536,
+            ray_bias: 2e-4,
+            normal_flip_y: false,
+            id_seed: 0,
         }
     }
 }
@@ -98,6 +116,7 @@ impl BakeSettings {
             self.curvature_radius,
             self.cage_front,
             self.cage_rear,
+            self.ray_bias,
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(BakeError::InvalidSettings(
@@ -109,6 +128,53 @@ impl BakeSettings {
             return Err(BakeError::InvalidSettings(
                 "thickness distance must be finite and greater than zero",
             ));
+        }
+        if self.cpu_threads > 32 {
+            return Err(BakeError::InvalidSettings(
+                "CPU thread limit must be between 0 (automatic) and 32",
+            ));
+        }
+        if !(64..=8192).contains(&self.memory_limit_mb) {
+            return Err(BakeError::InvalidSettings(
+                "memory budget must be between 64 and 8192 MiB",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn cpu_worker_count(&self) -> usize {
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        if self.cpu_threads == 0 {
+            (available / 2).clamp(1, 4)
+        } else {
+            (self.cpu_threads as usize).min(available).max(1)
+        }
+    }
+
+    /// Includes UV samples, their projected detail, dense working buffers, gutter seeds and
+    /// retained output maps. Mesh import/BVH memory is additional and does not scale with UV size.
+    pub fn estimated_memory_mb(&self) -> usize {
+        let pixels = self.size as u64 * self.size as u64;
+        let samples = pixels * self.supersampling as u64 * self.supersampling as u64;
+        let sample_bytes =
+            samples * (std::mem::size_of::<Texel>() + std::mem::size_of::<Detail>() + 20) as u64;
+        let output_bytes = pixels
+            * self
+                .maps
+                .iter()
+                .map(|k| k.components() as u64 * 2)
+                .sum::<u64>();
+        ((sample_bytes + pixels * 40 + output_bytes + 8 * 1024 * 1024).div_ceil(1024 * 1024))
+            as usize
+    }
+
+    pub fn validate_memory_budget(&self) -> Result<(), BakeError> {
+        let estimated_mb = self.estimated_memory_mb();
+        if estimated_mb > self.memory_limit_mb as usize {
+            return Err(BakeError::MemoryBudget {
+                estimated_mb,
+                limit_mb: self.memory_limit_mb as usize,
+            });
         }
         Ok(())
     }
@@ -127,36 +193,31 @@ pub struct BakeInput<'a> {
     pub material_slot: u32,
 }
 
-/// Shared progress / cancellation for a bake running on another thread.
-#[derive(Default)]
-pub struct Progress {
-    done: AtomicUsize,
-    total: AtomicUsize,
-    cancel: AtomicBool,
+/// Rendering front ends can supply a GPU baker without adding a GPU dependency to app/core.
+pub trait BakeBackend: Send + Sync {
+    fn name(&self) -> &str;
+    fn bake(
+        &self,
+        input: &BakeInput<'_>,
+        settings: &BakeSettings,
+        progress: &Progress,
+    ) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError>;
 }
 
-impl Progress {
-    pub fn new() -> Self {
-        Self::default()
+#[derive(Default)]
+pub struct CpuBakeBackend;
+
+impl BakeBackend for CpuBakeBackend {
+    fn name(&self) -> &str {
+        "CPU"
     }
-    pub fn fraction(&self) -> f32 {
-        let t = self.total.load(Ordering::Relaxed);
-        if t == 0 {
-            0.0
-        } else {
-            (self.done.load(Ordering::Relaxed) as f32 / t as f32).min(1.0)
-        }
-    }
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
-    /// Start another texture set with the same cancellation token.
-    pub fn reset_fraction(&self) {
-        self.done.store(0, Ordering::Relaxed);
-        self.total.store(0, Ordering::Relaxed);
+    fn bake(
+        &self,
+        input: &BakeInput<'_>,
+        settings: &BakeSettings,
+        progress: &Progress,
+    ) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError> {
+        bake(input, settings, progress)
     }
 }
 
@@ -165,6 +226,11 @@ pub enum BakeError {
     Cancelled,
     NoTexels,
     InvalidSettings(&'static str),
+    Backend(String),
+    MemoryBudget {
+        estimated_mb: usize,
+        limit_mb: usize,
+    },
 }
 
 impl std::fmt::Display for BakeError {
@@ -173,6 +239,14 @@ impl std::fmt::Display for BakeError {
             BakeError::Cancelled => f.write_str("bake cancelled"),
             BakeError::NoTexels => f.write_str("texture set has no UV-covered texels"),
             BakeError::InvalidSettings(reason) => write!(f, "invalid bake settings: {reason}"),
+            BakeError::Backend(reason) => write!(f, "bake backend: {reason}"),
+            BakeError::MemoryBudget {
+                estimated_mb,
+                limit_mb,
+            } => write!(
+                f,
+                "bake needs approximately {estimated_mb} MiB; budget is {limit_mb} MiB. Lower resolution or anti-aliasing"
+            ),
         }
     }
 }
@@ -200,12 +274,34 @@ pub fn bake(
     settings: &BakeSettings,
     progress: &Progress,
 ) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError> {
+    settings.validate()?;
+    settings.validate_memory_budget()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(settings.cpu_worker_count())
+            .thread_name(|i| format!("subcraft-bake-{i}"))
+            .build()
+            .map_err(|e| BakeError::Backend(e.to_string()))?;
+        pool.install(|| bake_cpu(input, settings, progress))
+    }
+    #[cfg(target_arch = "wasm32")]
+    bake_cpu(input, settings, progress)
+}
+
+fn bake_cpu(
+    input: &BakeInput<'_>,
+    settings: &BakeSettings,
+    progress: &Progress,
+) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError> {
     if progress.is_cancelled() {
         return Err(BakeError::Cancelled);
     }
     settings.validate()?;
-    progress.done.store(0, Ordering::Relaxed);
-    progress.total.store(0, Ordering::Relaxed);
+    if !progress.snapshot().backend.starts_with("CPU") {
+        progress.set_backend("CPU");
+    }
+    progress.begin(0);
     let size = settings.size;
     let sample_size = size * settings.supersampling;
     let low = input.low.mesh;
@@ -222,27 +318,38 @@ pub fn bake(
         .diagonal()
         .max(detail_geo.mesh.bounds.diagonal())
         .max(1e-6);
-    let bias = diag * 2e-4;
+    let bias = diag * settings.ray_bias;
+    let cage_diag = low.bounds.diagonal().max(1e-6);
 
     // Project onto the detail surface.
     let project = |t: &Texel| -> Detail {
         if let Some(high) = input.high {
-            let front = settings.cage_front * diag;
-            let rear = settings.cage_rear * diag;
+            let front = settings.cage_front * cage_diag;
+            let rear = settings.cage_rear * cage_diag;
             let n = t.normal.normalize_or(t.geometric_normal);
             if let Some(hit) = high
                 .bvh
                 .intersect(t.position + n * front, -n, 0.0, front + rear)
             {
-                let sp = high.mesh.interpolate(hit.tri as usize, hit.u, hit.v);
-                let ng = sp.geometric_normal;
-                let normal = if sp.normal.dot(n) < 0.0 {
-                    -sp.normal
+                // Detail projection needs positions/normals only. Never read high-poly UVs
+                // or tangents, even if a caller supplies geometry without those arrays.
+                let [a, b, c] = high.mesh.tri(hit.tri as usize).map(|i| i as usize);
+                let w = 1.0 - hit.u - hit.v;
+                let position = high.mesh.positions[a] * w
+                    + high.mesh.positions[b] * hit.u
+                    + high.mesh.positions[c] * hit.v;
+                let ng = high.mesh.geometric_normal(hit.tri as usize);
+                let source_normal = (high.mesh.normals[a] * w
+                    + high.mesh.normals[b] * hit.u
+                    + high.mesh.normals[c] * hit.v)
+                    .normalize_or(ng);
+                let normal = if source_normal.dot(n) < 0.0 {
+                    -source_normal
                 } else {
-                    sp.normal
+                    source_normal
                 };
                 return Detail {
-                    position: sp.position,
+                    position,
                     normal,
                     tri: hit.tri,
                     offset: if ng.dot(n) < 0.0 { -ng } else { ng },
@@ -263,9 +370,9 @@ pub fn bake(
     let mut maps = settings.maps.clone();
     maps.sort();
     maps.dedup();
-    let work_items = (maps.len() + 1) * samples.len();
-    progress.total.store(work_items, Ordering::Relaxed);
-    progress.done.store(0, Ordering::Relaxed);
+    let work_items = (maps.len() + 1) * samples.len() + maps.len();
+    progress.set_total(work_items);
+    progress.set_phase(BakePhase::Projecting);
 
     let mut details = Vec::with_capacity(samples.len());
     for chunk in samples.chunks(CHUNK) {
@@ -273,7 +380,7 @@ pub fn bake(
             return Err(BakeError::Cancelled);
         }
         details.par_extend(chunk.par_iter().map(project));
-        progress.done.fetch_add(chunk.len(), Ordering::Relaxed);
+        progress.advance(chunk.len());
     }
     let low_elements = if wanted(MeshMapKind::Id) {
         Some(topology::mesh_elements(low))
@@ -289,7 +396,9 @@ pub fn bake(
     let extent = bounds.extent().max(Vec3::splat(1e-6));
 
     let mut out = BTreeMap::new();
-    for &kind in &maps {
+    for (map_index, &kind) in maps.iter().enumerate() {
+        progress.set_map(kind, map_index + 1, maps.len());
+        progress.set_map_work(samples.len() + 1);
         let comps = kind.components();
         // Per-texel evaluation, chunked for cancellation and progress.
         let eval = |i: usize, dirs: &mut Vec<Vec3>| -> [f32; 3] {
@@ -304,7 +413,15 @@ pub fn bake(
                     let bit = n.cross(tan) * if t.tangent.w < 0.0 { -1.0 } else { 1.0 };
                     let h = d.normal;
                     let ts = Vec3::new(h.dot(tan), h.dot(bit), h.dot(n)).normalize_or(Vec3::Z);
-                    [ts.x * 0.5 + 0.5, ts.y * 0.5 + 0.5, ts.z * 0.5 + 0.5]
+                    [
+                        ts.x * 0.5 + 0.5,
+                        if settings.normal_flip_y {
+                            0.5 - ts.y * 0.5
+                        } else {
+                            ts.y * 0.5 + 0.5
+                        },
+                        ts.z * 0.5 + 0.5,
+                    ]
                 }
                 MeshMapKind::WorldSpaceNormal => {
                     let n = d.normal;
@@ -321,7 +438,7 @@ pub fn bake(
                         low_elements.as_ref()
                     };
                     let e = elements.map_or(0, |e| e[d.tri as usize]);
-                    let hue = (e as f32 * 0.618_034).fract();
+                    let hue = ((e.wrapping_add(settings.id_seed)) as f32 * 0.618_034).fract();
                     hsv_to_rgb([hue, 0.65, 0.9])
                 }
                 MeshMapKind::AmbientOcclusion => {
@@ -330,6 +447,9 @@ pub fn bake(
                     let dist = settings.ao_distance * diag;
                     let (mut occluded, mut counted) = (0u32, 0u32);
                     for dir in dirs.iter() {
+                        if progress.is_cancelled() {
+                            break;
+                        }
                         if dir.dot(d.offset) <= 0.0 {
                             continue;
                         }
@@ -357,6 +477,9 @@ pub fn bake(
                     let total: f32 = dirs
                         .iter()
                         .map(|dir| {
+                            if progress.is_cancelled() {
+                                return max;
+                            }
                             geometry
                                 .bvh
                                 .intersect(origin, *dir, 0.0, max)
@@ -414,7 +537,10 @@ pub fn bake(
                 counts[i] += 1;
                 covered[i] = true;
             }
-            progress.done.fetch_add(end - start, Ordering::Relaxed);
+            progress.advance(end - start);
+            if progress.should_publish_preview() {
+                publish_dense_preview(progress, kind, size, &dense, Some(&counts), false);
+            }
         }
         if settings.supersampling > 1 && kind != MeshMapKind::Id {
             for (pixel, &count) in dense.chunks_exact_mut(comps).zip(&counts) {
@@ -433,7 +559,15 @@ pub fn bake(
                 }
             }
         }
-        dilate_infinite(size as usize, size as usize, comps, &mut dense, &covered);
+        progress.set_phase(BakePhase::Padding);
+        padding::dilate_cancellable(
+            size as usize,
+            size as usize,
+            comps,
+            &mut dense,
+            &covered,
+            progress,
+        )?;
         if progress.is_cancelled() {
             return Err(BakeError::Cancelled);
         }
@@ -443,8 +577,49 @@ pub fn bake(
             kind,
             TiledImage::from_dense(size, size, comps, fill, &dense),
         );
+        publish_dense_preview(progress, kind, size, &dense, None, true);
+        progress.advance(1);
     }
+    progress.set_phase(BakePhase::Completed);
     Ok(out)
+}
+
+/// Small genuine working-texture preview; uncovered pixels remain transparent until padded.
+pub fn publish_dense_preview(
+    progress: &Progress,
+    kind: MeshMapKind,
+    size: u32,
+    dense: &[f32],
+    counts: Option<&[u16]>,
+    force: bool,
+) {
+    let side = size.min(256);
+    let comps = kind.components();
+    if side == 0 || dense.len() != size as usize * size as usize * comps {
+        return;
+    }
+    let mut rgba = Vec::with_capacity(side as usize * side as usize * 4);
+    for y in 0..side {
+        for x in 0..side {
+            let i = ((y * size / side) * size + x * size / side) as usize;
+            let count = counts.map_or(1, |counts| counts[i]);
+            let divisor = if kind == MeshMapKind::Id {
+                1
+            } else {
+                count.max(1)
+            } as f32;
+            for c in 0..3 {
+                let channel = if comps == 1 { 0 } else { c };
+                rgba.push(
+                    (dense[i * comps + channel] / divisor)
+                        .clamp(0.0, 1.0)
+                        .mul_add(255.0, 0.5) as u8,
+                );
+            }
+            rgba.push(if count == 0 { 0 } else { 255 });
+        }
+    }
+    progress.publish_preview(kind, side, side, rgba, force);
 }
 
 #[cfg(test)]

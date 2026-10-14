@@ -1,0 +1,21 @@
+[package]
+name = "subcraft-bake-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+subcraft-bake.workspace = true
+subcraft-core.workspace = true
+subcraft-image.workspace = true
+subcraft-mesh.workspace = true
+egui-wgpu.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+pollster.workspace = true
+log.workspace = true
+rayon.workspace = true

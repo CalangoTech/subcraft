@@ -29,9 +29,13 @@ fn main() -> anyhow::Result<()> {
         match a.as_str() {
             "--demo" => options.demo = true,
             "--view-2d" => options.view_2d = true,
+            "--bake-view" => options.bake_view = true,
+            "--bake-demo" => { options.bake_demo = true; options.bake_view = true; }
+            "--bake-demo-final" => { options.bake_demo = true; options.bake_view = true; options.bake_demo_final = true; }
+            "--cage-view" => { options.cage_view = true; options.bake_view = true; }
             "--screenshot" => options.screenshot = args.next().map(Into::into),
             "-h" | "--help" => {
-                println!("usage: subcraft [project.subcraft | mesh file] [--demo] [--view-2d] [--screenshot out.png]");
+                println!("usage: subcraft [project.subcraft | mesh file] [--demo] [--view-2d] [--bake-view | --bake-demo | --bake-demo-final | --cage-view] [--screenshot out.png]");
                 return Ok(());
             }
             path => options.mesh = Some(path.into()),
