@@ -3,16 +3,26 @@ use subcraft_core::MeshMapKind;
 use subcraft_mesh::{Bvh, Corner, Mesh, MeshBuilder, primitives};
 
 use super::*;
+use crate::surface::texels;
 
 const RES: u32 = 128;
 
 fn settings(maps: &[MeshMapKind]) -> BakeSettings {
-    BakeSettings { size: RES, maps: maps.to_vec(), ao_samples: 64, ..BakeSettings::default() }
+    BakeSettings {
+        size: RES,
+        maps: maps.to_vec(),
+        ao_samples: 64,
+        ..BakeSettings::default()
+    }
 }
 
 fn bake_low(mesh: &Mesh, maps: &[MeshMapKind], slot: u32) -> BTreeMap<MeshMapKind, TiledImage> {
     let bvh = Bvh::build(mesh);
-    let input = BakeInput { low: Geometry { mesh, bvh: &bvh }, high: None, material_slot: slot };
+    let input = BakeInput {
+        low: Geometry { mesh, bvh: &bvh },
+        high: None,
+        material_slot: slot,
+    };
     bake(&input, &settings(maps), &Progress::new()).unwrap()
 }
 
@@ -21,11 +31,19 @@ fn at(img: &TiledImage, t: &Texel) -> [f32; 4] {
 }
 
 fn corner(p: Vec3, uv: Vec2) -> Corner {
-    Corner { position: p, normal: None, uv: Some(uv) }
+    Corner {
+        position: p,
+        normal: None,
+        uv: Some(uv),
+    }
 }
 
 fn corner_n(p: Vec3, n: Vec3, uv: Vec2) -> Corner {
-    Corner { position: p, normal: Some(n), uv: Some(uv) }
+    Corner {
+        position: p,
+        normal: Some(n),
+        uv: Some(uv),
+    }
 }
 
 /// A 4×4 floor (UV left half) with a 1×1×1 box standing on it (UV right half, other material
@@ -37,9 +55,17 @@ fn floor_with_box() -> Mesh {
     let s = 8;
     for i in 0..s {
         for j in 0..s {
-            let (x0, x1) = (-2.0 + 4.0 * j as f32 / s as f32, -2.0 + 4.0 * (j + 1) as f32 / s as f32);
-            let (z0, z1) = (-2.0 + 4.0 * i as f32 / s as f32, -2.0 + 4.0 * (i + 1) as f32 / s as f32);
-            let uv = |x: f32, z: f32| Vec2::new((x + 2.0) / 4.0 * 0.98 + 0.01, (z + 2.0) / 4.0 * 0.98 + 0.01);
+            let (x0, x1) = (
+                -2.0 + 4.0 * j as f32 / s as f32,
+                -2.0 + 4.0 * (j + 1) as f32 / s as f32,
+            );
+            let (z0, z1) = (
+                -2.0 + 4.0 * i as f32 / s as f32,
+                -2.0 + 4.0 * (i + 1) as f32 / s as f32,
+            );
+            let uv = |x: f32, z: f32| {
+                Vec2::new((x + 2.0) / 4.0 * 0.98 + 0.01, (z + 2.0) / 4.0 * 0.98 + 0.01)
+            };
             let p = |x: f32, z: f32| corner_n(Vec3::new(x, 0.0, z), Vec3::Y, uv(x, z));
             b.push_triangle(floor, [p(x0, z0), p(x0, z1), p(x1, z1)]);
             b.push_triangle(floor, [p(x0, z0), p(x1, z1), p(x1, z0)]);
@@ -69,17 +95,35 @@ fn ao_open_plane_is_unoccluded() {
 #[test]
 fn ao_and_curvature_darken_the_contact_with_a_box() {
     let mesh = floor_with_box();
-    let maps = bake_low(&mesh, &[MeshMapKind::AmbientOcclusion, MeshMapKind::Curvature], 0);
-    let (ao, curv) = (&maps[&MeshMapKind::AmbientOcclusion], &maps[&MeshMapKind::Curvature]);
+    let maps = bake_low(
+        &mesh,
+        &[MeshMapKind::AmbientOcclusion, MeshMapKind::Curvature],
+        0,
+    );
+    let (ao, curv) = (
+        &maps[&MeshMapKind::AmbientOcclusion],
+        &maps[&MeshMapKind::Curvature],
+    );
     let ts = texels(&mesh, 0, RES);
     let dist_to_box = |p: Vec3| (p.x.abs() - 0.5).max(p.z.abs() - 0.5).max(0.0);
-    let near: Vec<&Texel> = ts.iter().filter(|t| dist_to_box(t.position) < 0.06 && dist_to_box(t.position) > 0.0).collect();
-    let far: Vec<&Texel> = ts.iter().filter(|t| dist_to_box(t.position) > 1.2).collect();
+    let near: Vec<&Texel> = ts
+        .iter()
+        .filter(|t| dist_to_box(t.position) < 0.06 && dist_to_box(t.position) > 0.0)
+        .collect();
+    let far: Vec<&Texel> = ts
+        .iter()
+        .filter(|t| dist_to_box(t.position) > 1.2)
+        .collect();
     assert!(!near.is_empty() && !far.is_empty());
-    let mean = |v: &[&Texel], img: &TiledImage| v.iter().map(|t| at(img, t)[0]).sum::<f32>() / v.len() as f32;
+    let mean = |v: &[&Texel], img: &TiledImage| {
+        v.iter().map(|t| at(img, t)[0]).sum::<f32>() / v.len() as f32
+    };
     let (ao_near, ao_far) = (mean(&near, ao), mean(&far, ao));
     assert!(ao_far > 0.97, "far floor unoccluded ({ao_far})");
-    assert!(ao_near < ao_far - 0.15, "floor next to the box is occluded ({ao_near} vs {ao_far})");
+    assert!(
+        ao_near < ao_far - 0.15,
+        "floor next to the box is occluded ({ao_near} vs {ao_far})"
+    );
     let (c_near, c_far) = (mean(&near, curv), mean(&far, curv));
     assert!((c_far - 0.5).abs() < 0.01, "flat floor curvature {c_far}");
     assert!(c_near < 0.4, "concave crease is dark ({c_near})");
@@ -95,7 +139,10 @@ fn curvature_brightens_cube_edges_and_keeps_faces_flat() {
     let mut center = Vec::new();
     for t in texels(&mesh, 0, RES) {
         let p = t.position.abs();
-        let near_one = [p.x, p.y, p.z].iter().filter(|&&c| 1.0 - c < radius * 0.4).count();
+        let near_one = [p.x, p.y, p.z]
+            .iter()
+            .filter(|&&c| 1.0 - c < radius * 0.4)
+            .count();
         if near_one >= 2 {
             edge.push(at(curv, &t)[0]);
         } else if [p.x, p.y, p.z].iter().filter(|&&c| c < 0.5).count() == 2 {
@@ -105,16 +152,30 @@ fn curvature_brightens_cube_edges_and_keeps_faces_flat() {
     let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
     assert!(edge.len() > 20 && center.len() > 100);
     assert!(avg(&edge) > 0.7, "convex edges bright ({})", avg(&edge));
-    assert!(center.iter().all(|c| (c - 0.5).abs() < 1e-3), "face centers flat");
+    assert!(
+        center.iter().all(|c| (c - 0.5).abs() < 1e-3),
+        "face centers flat"
+    );
 }
 
 #[test]
 fn low_on_low_normals_are_flat_and_world_normals_match_faces() {
     let mesh = primitives::cube(2.0);
-    let maps = bake_low(&mesh, &[MeshMapKind::Normal, MeshMapKind::WorldSpaceNormal, MeshMapKind::Position], 0);
+    let maps = bake_low(
+        &mesh,
+        &[
+            MeshMapKind::Normal,
+            MeshMapKind::WorldSpaceNormal,
+            MeshMapKind::Position,
+        ],
+        0,
+    );
     for t in texels(&mesh, 0, RES).iter().step_by(11) {
         let n = at(&maps[&MeshMapKind::Normal], t);
-        assert!((n[0] - 0.5).abs() < 2e-3 && (n[1] - 0.5).abs() < 2e-3 && (n[2] - 1.0).abs() < 2e-3, "{n:?}");
+        assert!(
+            (n[0] - 0.5).abs() < 2e-3 && (n[1] - 0.5).abs() < 2e-3 && (n[2] - 1.0).abs() < 2e-3,
+            "{n:?}"
+        );
         let w = at(&maps[&MeshMapKind::WorldSpaceNormal], t);
         let expect = t.normal * 0.5 + Vec3::splat(0.5);
         assert!((Vec3::new(w[0], w[1], w[2]) - expect).length() < 3e-3);
@@ -130,8 +191,14 @@ fn bumped_plane() -> Mesh {
     let s = 64;
     let h = |x: f32, z: f32| 0.15 * (-(x * x + z * z) / 0.08).exp();
     let p = |i: u32, j: u32| {
-        let (x, z) = (j as f32 / s as f32 * 2.0 - 1.0, i as f32 / s as f32 * 2.0 - 1.0);
-        corner(Vec3::new(x, h(x, z), z), Vec2::new((x + 1.0) * 0.5, (z + 1.0) * 0.5))
+        let (x, z) = (
+            j as f32 / s as f32 * 2.0 - 1.0,
+            i as f32 / s as f32 * 2.0 - 1.0,
+        );
+        corner(
+            Vec3::new(x, h(x, z), z),
+            Vec2::new((x + 1.0) * 0.5, (z + 1.0) * 0.5),
+        )
     };
     for i in 0..s {
         for j in 0..s {
@@ -147,8 +214,24 @@ fn normal_map_from_high_poly_captures_the_bump() {
     let low = primitives::plane(2.0, 1);
     let high = bumped_plane();
     let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
-    let input = BakeInput { low: Geometry { mesh: &low, bvh: &lb }, high: Some(Geometry { mesh: &high, bvh: &hb }), material_slot: 0 };
-    let s = BakeSettings { size: RES, maps: vec![MeshMapKind::Normal], cage_front: 0.1, cage_rear: 0.05, ..BakeSettings::default() };
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &lb,
+        },
+        high: Some(Geometry {
+            mesh: &high,
+            bvh: &hb,
+        }),
+        material_slot: 0,
+    };
+    let s = BakeSettings {
+        size: RES,
+        maps: vec![MeshMapKind::Normal],
+        cage_front: 0.1,
+        cage_rear: 0.05,
+        ..BakeSettings::default()
+    };
     let maps = bake(&input, &s, &Progress::new()).unwrap();
     let nm = &maps[&MeshMapKind::Normal];
     let mut tilted = 0;
@@ -156,13 +239,19 @@ fn normal_map_from_high_poly_captures_the_bump() {
         let n = at(nm, &t);
         let r = Vec2::new(t.position.x, t.position.z).length();
         if r > 0.8 {
-            assert!((n[0] - 0.5).abs() < 0.02 && (n[1] - 0.5).abs() < 0.02, "flat area stays flat: {n:?}");
+            assert!(
+                (n[0] - 0.5).abs() < 0.02 && (n[1] - 0.5).abs() < 0.02,
+                "flat area stays flat: {n:?}"
+            );
         }
         if (0.15..0.3).contains(&r) && ((n[0] - 0.5).abs() > 0.1 || (n[1] - 0.5).abs() > 0.1) {
             tilted += 1;
         }
     }
-    assert!(tilted > 100, "bump slope recorded in the normal map ({tilted} texels)");
+    assert!(
+        tilted > 100,
+        "bump slope recorded in the normal map ({tilted} texels)"
+    );
 }
 
 #[test]
@@ -172,11 +261,20 @@ fn thickness_is_bright_on_thin_parts() {
     let center = |m: &Mesh| {
         let maps = bake_low(m, &[MeshMapKind::Thickness], 0);
         let ts = texels(m, 0, RES);
-        let t = ts.iter().min_by(|a, b| (a.position.x.abs() + a.position.y.abs()).total_cmp(&(b.position.x.abs() + b.position.y.abs()))).unwrap();
+        let t = ts
+            .iter()
+            .min_by(|a, b| {
+                (a.position.x.abs() + a.position.y.abs())
+                    .total_cmp(&(b.position.x.abs() + b.position.y.abs()))
+            })
+            .unwrap();
         at(&maps[&MeshMapKind::Thickness], t)[0]
     };
     let (thin, thick) = (center(&slab), center(&cube));
-    assert!(thin > 0.8 && thick < thin - 0.3, "thin {thin} vs thick {thick}");
+    assert!(
+        thin > 0.8 && thick < thin - 0.3,
+        "thin {thin} vs thick {thick}"
+    );
 }
 
 #[test]
@@ -184,15 +282,261 @@ fn id_colors_differ_per_element_and_cancel_stops() {
     let mesh = primitives::sample_crate();
     let maps = bake_low(&mesh, &[MeshMapKind::Id], 1);
     let id = &maps[&MeshMapKind::Id];
-    let mut colors: Vec<[u32; 3]> =
-        texels(&mesh, 1, RES).iter().map(|t| at(id, t)).map(|c| [(c[0] * 100.0) as u32, (c[1] * 100.0) as u32, (c[2] * 100.0) as u32]).collect();
+    let mut colors: Vec<[u32; 3]> = texels(&mesh, 1, RES)
+        .iter()
+        .map(|t| at(id, t))
+        .map(|c| {
+            [
+                (c[0] * 100.0) as u32,
+                (c[1] * 100.0) as u32,
+                (c[2] * 100.0) as u32,
+            ]
+        })
+        .collect();
     colors.sort();
     colors.dedup();
-    assert!(colors.len() >= 6, "trim posts and bands get distinct ID colors ({})", colors.len());
+    assert!(
+        colors.len() >= 6,
+        "trim posts and bands get distinct ID colors ({})",
+        colors.len()
+    );
 
     let bvh = Bvh::build(&mesh);
-    let input = BakeInput { low: Geometry { mesh: &mesh, bvh: &bvh }, high: None, material_slot: 0 };
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &mesh,
+            bvh: &bvh,
+        },
+        high: None,
+        material_slot: 0,
+    };
     let p = Progress::new();
     p.cancel();
-    assert_eq!(bake(&input, &settings(&[MeshMapKind::AmbientOcclusion]), &p).unwrap_err(), BakeError::Cancelled);
+    assert_eq!(
+        bake(&input, &settings(&[MeshMapKind::AmbientOcclusion]), &p).unwrap_err(),
+        BakeError::Cancelled
+    );
+}
+
+#[test]
+fn high_poly_file_without_uvs_transfers_normal_detail() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../mesh/tests/fixtures/high-poly-no-uv.obj");
+    let high = subcraft_mesh::import_high_poly(&path).unwrap().mesh;
+    let low = primitives::plane(2.0, 1);
+    let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &lb,
+        },
+        high: Some(Geometry {
+            mesh: &high,
+            bvh: &hb,
+        }),
+        material_slot: 0,
+    };
+    let s = BakeSettings {
+        size: 64,
+        maps: vec![MeshMapKind::Normal, MeshMapKind::WorldSpaceNormal],
+        cage_front: 0.15,
+        cage_rear: 0.15,
+        ..Default::default()
+    };
+    let maps = bake(&input, &s, &Progress::new()).unwrap();
+    let expect = Vec3::new(-0.1, 1.0, 0.0).normalize();
+    let world = maps[&MeshMapKind::WorldSpaceNormal].get(32, 32);
+    let actual = Vec3::new(world[0], world[1], world[2]) * 2.0 - Vec3::ONE;
+    assert!(
+        (actual - expect).length() < 0.002,
+        "UVless high-poly detail was transferred: {actual:?}"
+    );
+    let normal = maps[&MeshMapKind::Normal].get(32, 32);
+    assert!(
+        (normal[0] - 0.5).abs() > 0.04 || (normal[1] - 0.5).abs() > 0.04,
+        "normal map must record the source slope: {normal:?}"
+    );
+}
+
+#[test]
+fn projection_misses_use_low_poly_indices_and_geometry() {
+    // Low has more triangles than high; the old fallback indexed high's element array with
+    // low's triangle index, panicking on this legitimate projection miss.
+    let low = primitives::cube(2.0);
+    let mut high = primitives::plane(2.0, 1);
+    for p in &mut high.positions {
+        p.y += 100.0;
+    }
+    high.bounds = subcraft_mesh::Aabb::from_points(high.positions.iter().copied());
+    let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &lb,
+        },
+        high: Some(Geometry {
+            mesh: &high,
+            bvh: &hb,
+        }),
+        material_slot: 0,
+    };
+    let s = BakeSettings {
+        size: 32,
+        maps: MeshMapKind::ALL.to_vec(),
+        ao_samples: 4,
+        thickness_samples: 4,
+        ..Default::default()
+    };
+    let maps = bake(&input, &s, &Progress::new()).unwrap();
+    for map in maps.values() {
+        assert!(map.to_dense().iter().all(|v| v.is_finite()));
+    }
+    let no_high = BakeInput {
+        high: None,
+        ..input
+    };
+    let reference = bake(&no_high, &s, &Progress::new()).unwrap();
+    assert_eq!(maps[&MeshMapKind::Normal], reference[&MeshMapKind::Normal]);
+    assert_eq!(maps[&MeshMapKind::Id], reference[&MeshMapKind::Id]);
+}
+
+#[test]
+fn supersampling_preserves_flat_normals_and_categorical_ids() {
+    let low = primitives::cube(2.0);
+    let bvh = Bvh::build(&low);
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &bvh,
+        },
+        high: None,
+        material_slot: 0,
+    };
+    let s = BakeSettings {
+        size: 32,
+        supersampling: 4,
+        maps: vec![MeshMapKind::Normal, MeshMapKind::Id],
+        ..Default::default()
+    };
+    let progress = Progress::new();
+    let maps = bake(&input, &s, &progress).unwrap();
+    for pixel in maps[&MeshMapKind::Normal].to_dense().as_chunks::<3>().0 {
+        assert!(
+            (pixel[0] - 0.5).abs() < 0.002
+                && (pixel[1] - 0.5).abs() < 0.002
+                && (pixel[2] - 1.0).abs() < 0.002
+        );
+    }
+    let ids = maps[&MeshMapKind::Id].to_dense();
+    assert!(ids.as_chunks::<3>().0.iter().all(|p| (p[0] - 0.9).abs() < 0.002
+        && (p[1] - 0.315).abs() < 0.002
+        && (p[2] - 0.315).abs() < 0.002));
+    assert_eq!(progress.fraction(), 1.0);
+}
+
+#[test]
+fn supersampling_reduces_subpixel_signal_error() {
+    // A hard normal boundary crosses pixels away from their centers. Supersampling must
+    // produce the normalized area average, while native sampling picks either face.
+    let low = primitives::plane(2.0, 1);
+    let mut builder = MeshBuilder::new("Split normal source");
+    let material = builder.material("High");
+    for (left, right, n) in [
+        (-1.0, 0.025, Vec3::Y),
+        (0.025, 1.0, Vec3::new(-0.6, 0.8, 0.0)),
+    ] {
+        let c = |x, z| Corner {
+            position: Vec3::new(x, 0.0, z),
+            normal: Some(n),
+            uv: None,
+        };
+        builder.push_triangle(material, [c(left, -1.0), c(left, 1.0), c(right, 1.0)]);
+        builder.push_triangle(material, [c(left, -1.0), c(right, 1.0), c(right, -1.0)]);
+    }
+    let high = builder.build_for_baking().unwrap();
+    let (lb, hb) = (Bvh::build(&low), Bvh::build(&high));
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &lb,
+        },
+        high: Some(Geometry {
+            mesh: &high,
+            bvh: &hb,
+        }),
+        material_slot: 0,
+    };
+    let settings = BakeSettings {
+        size: 16,
+        maps: vec![MeshMapKind::WorldSpaceNormal],
+        ..Default::default()
+    };
+    let native = bake(&input, &settings, &Progress::new()).unwrap();
+    let aa = bake(
+        &input,
+        &BakeSettings {
+            supersampling: 4,
+            ..settings
+        },
+        &Progress::new(),
+    )
+    .unwrap();
+    let decode = |pixel: [f32; 4]| Vec3::new(pixel[0], pixel[1], pixel[2]) * 2.0 - Vec3::ONE;
+    let native = decode(native[&MeshMapKind::WorldSpaceNormal].get(8, 8));
+    let aa = decode(aa[&MeshMapKind::WorldSpaceNormal].get(8, 8));
+    let expected = (Vec3::Y * 0.2 + Vec3::new(-0.6, 0.8, 0.0) * 0.8).normalize();
+    assert!(
+        (aa - expected).length() < (native - expected).length(),
+        "AA {aa:?} must approximate area average {expected:?} better than native {native:?}"
+    );
+    assert!(
+        (aa.length() - 1.0).abs() < 0.003,
+        "averaged normals must stay normalized"
+    );
+}
+
+#[test]
+fn invalid_settings_fail_before_allocating() {
+    let low = primitives::plane(2.0, 1);
+    let bvh = Bvh::build(&low);
+    let input = BakeInput {
+        low: Geometry {
+            mesh: &low,
+            bvh: &bvh,
+        },
+        high: None,
+        material_slot: 0,
+    };
+    for s in [
+        BakeSettings {
+            size: u32::MAX,
+            ..Default::default()
+        },
+        BakeSettings {
+            size: 4096,
+            supersampling: 4,
+            ..Default::default()
+        },
+        BakeSettings {
+            ao_samples: 0,
+            ..Default::default()
+        },
+        BakeSettings {
+            thickness_distance: 0.0,
+            ..Default::default()
+        },
+        BakeSettings {
+            cage_front: f32::NAN,
+            ..Default::default()
+        },
+        BakeSettings {
+            maps: Vec::new(),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            bake(&input, &s, &Progress::new()),
+            Err(BakeError::InvalidSettings(_))
+        ));
+    }
 }

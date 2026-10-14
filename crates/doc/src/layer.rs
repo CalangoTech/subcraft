@@ -39,7 +39,9 @@ pub struct PaintContent {
 impl PaintContent {
     /// Image for a channel, creating an empty (transparent) one on first use.
     pub fn channel_mut(&mut self, kind: ChannelKind, resolution: u32) -> &mut TiledImage {
-        self.channels.entry(kind).or_insert_with(|| empty_paint_image(kind, resolution))
+        self.channels
+            .entry(kind)
+            .or_insert_with(|| empty_paint_image(kind, resolution))
     }
 }
 
@@ -63,11 +65,19 @@ pub struct FillChannel {
 
 impl FillChannel {
     pub fn new(source: FillSource) -> Self {
-        Self { enabled: true, source, strength: 1.0 }
+        Self {
+            enabled: true,
+            source,
+            strength: 1.0,
+        }
     }
 
     pub fn disabled(source: FillSource) -> Self {
-        Self { enabled: false, source, strength: 1.0 }
+        Self {
+            enabled: false,
+            source,
+            strength: 1.0,
+        }
     }
 }
 
@@ -103,6 +113,9 @@ pub struct Layer {
     pub id: LayerId,
     pub name: String,
     pub visible: bool,
+    /// Protect the layer (and, for folders, its descendants) from accidental edits.
+    /// This does not change compositing and survives project saves.
+    pub locked: bool,
     pub blend: BTreeMap<ChannelKind, ChannelBlend>,
     pub mask: Option<Mask>,
     /// Show the layer only on these mesh parts (like a geometry mask); `None` = everywhere.
@@ -121,13 +134,20 @@ pub struct PartMask {
 
 impl PartMask {
     pub fn new(parts: impl IntoIterator<Item = u32>) -> Self {
-        Self { enabled: true, parts: parts.into_iter().collect() }
+        Self {
+            enabled: true,
+            parts: parts.into_iter().collect(),
+        }
     }
 
     /// Visibility factor for texels of `part` (texels outside every triangle have no part).
     #[inline]
     pub fn factor(&self, part: Option<u32>) -> f32 {
-        if !self.enabled || part.is_some_and(|p| self.parts.contains(&p)) { 1.0 } else { 0.0 }
+        if !self.enabled || part.is_some_and(|p| self.parts.contains(&p)) {
+            1.0
+        } else {
+            0.0
+        }
     }
 }
 
@@ -153,6 +173,7 @@ impl Layer {
             id: LayerId::new(),
             name: name.into(),
             visible: true,
+            locked: false,
             blend: default_blends(ts, false),
             mask: None,
             parts: None,
@@ -165,16 +186,25 @@ impl Layer {
         let channels = ts
             .channels
             .iter()
-            .map(|c| (c.kind, FillChannel::new(FillSource::uniform(c.kind.default_paint_value()))))
+            .map(|c| {
+                (
+                    c.kind,
+                    FillChannel::new(FillSource::uniform(c.kind.default_paint_value())),
+                )
+            })
             .collect();
         Self {
             id: LayerId::new(),
             name: name.into(),
             visible: true,
+            locked: false,
             blend: default_blends(ts, false),
             mask: None,
             parts: None,
-            content: LayerContent::Fill(FillContent { projection: Projection::default(), channels }),
+            content: LayerContent::Fill(FillContent {
+                projection: Projection::default(),
+                channels,
+            }),
         }
     }
 
@@ -183,10 +213,14 @@ impl Layer {
             id: LayerId::new(),
             name: name.into(),
             visible: true,
+            locked: false,
             blend: default_blends(ts, true),
             mask: None,
             parts: None,
-            content: LayerContent::Group(GroupContent { children: Vec::new(), expanded: true }),
+            content: LayerContent::Group(GroupContent {
+                children: Vec::new(),
+                expanded: true,
+            }),
         }
     }
 
@@ -217,7 +251,10 @@ impl Layer {
     }
 
     pub fn blend_for(&self, kind: ChannelKind) -> ChannelBlend {
-        self.blend.get(&kind).copied().unwrap_or(ChannelBlend::new(BlendMode::Disable))
+        self.blend
+            .get(&kind)
+            .copied()
+            .unwrap_or(ChannelBlend::new(BlendMode::Disable))
     }
 
     /// Deep copy with fresh ids for this node, its children and mask effects.
@@ -292,7 +329,11 @@ impl Layer {
 
     /// Equality ignoring raster contents (used for dirty-region diffing).
     pub fn same_parameters(&self, other: &Layer) -> bool {
-        if self.id != other.id || self.visible != other.visible || self.blend != other.blend || self.parts != other.parts {
+        if self.id != other.id
+            || self.visible != other.visible
+            || self.blend != other.blend
+            || self.parts != other.parts
+        {
             return false;
         }
         let masks_same = match (&self.mask, &other.mask) {
@@ -302,7 +343,10 @@ impl Layer {
                     && a.base.same_layout(&b.base)
                     && a.base.fill() == b.base.fill()
                     && a.effects.len() == b.effects.len()
-                    && a.effects.iter().zip(&b.effects).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+                    && a.effects
+                        .iter()
+                        .zip(&b.effects)
+                        .all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
             }
             _ => false,
         };
@@ -313,16 +357,25 @@ impl Layer {
             // A channel image present on one side only is a raster change (absent = transparent,
             // e.g. created lazily by the first stroke) as long as it has the paint-image layout.
             (LayerContent::Paint(a), LayerContent::Paint(b)) => {
-                let keys: std::collections::BTreeSet<_> = a.channels.keys().chain(b.channels.keys()).collect();
-                keys.into_iter().all(|k| match (a.channels.get(k), b.channels.get(k)) {
-                    (Some(ia), Some(ib)) => ia.same_layout(ib),
-                    (Some(i), None) | (None, Some(i)) => i.same_layout(&empty_paint_image(*k, i.width())) && i.width() == i.height(),
-                    (None, None) => true,
-                })
+                let keys: std::collections::BTreeSet<_> =
+                    a.channels.keys().chain(b.channels.keys()).collect();
+                keys.into_iter()
+                    .all(|k| match (a.channels.get(k), b.channels.get(k)) {
+                        (Some(ia), Some(ib)) => ia.same_layout(ib),
+                        (Some(i), None) | (None, Some(i)) => {
+                            i.same_layout(&empty_paint_image(*k, i.width()))
+                                && i.width() == i.height()
+                        }
+                        (None, None) => true,
+                    })
             }
             (LayerContent::Fill(a), LayerContent::Fill(b)) => a == b,
             (LayerContent::Group(a), LayerContent::Group(b)) => {
-                a.children.len() == b.children.len() && a.children.iter().zip(&b.children).all(|(x, y)| x.id == y.id)
+                a.children.len() == b.children.len()
+                    && a.children
+                        .iter()
+                        .zip(&b.children)
+                        .all(|(x, y)| x.id == y.id)
             }
             _ => false,
         }

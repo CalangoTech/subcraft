@@ -12,7 +12,7 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
         panel(ui, |ui| {
             section(ui, "tool", "Tool", true, |ui| {
                 prop_row(ui, "Tool", |ui| {
-                    segmented(ui, &mut state.tool, &[(Tool::Brush, "Brush"), (Tool::Eraser, "Eraser"), (Tool::PolygonFill, "Fill")]);
+                    segmented(ui, &mut state.tool, &[(Tool::Brush, "Brush"), (Tool::Eraser, "Eraser"), (Tool::PolygonFill, "Fill"), (Tool::Eyedropper, "Pick")]);
                 });
                 if state.tool == Tool::PolygonFill {
                     prop_row(ui, "Fill by", |ui| {

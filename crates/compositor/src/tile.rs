@@ -14,7 +14,7 @@ use subcraft_materials::eval_fill_tile;
 
 use crate::TileContext;
 use crate::blend::{BlendTarget, composite};
-use crate::mask::eval_mask;
+use crate::mask::{SharedMaskCache, eval_mask, eval_mask_cached};
 use crate::util::read_tile_rgba;
 
 /// Running accumulation of one channel over a tile.
@@ -28,44 +28,83 @@ struct Acc {
 impl Acc {
     fn root(kind: ChannelKind) -> Self {
         let d = kind.default_value().0;
-        Self { kind, target: BlendTarget::for_channel(kind), px: vec![[d[0], d[1], d[2], 1.0]; TILE_TEXELS] }
+        Self {
+            kind,
+            target: BlendTarget::for_channel(kind),
+            px: vec![[d[0], d[1], d[2], 1.0]; TILE_TEXELS],
+        }
     }
 
     fn transparent(kind: ChannelKind) -> Self {
-        Self { kind, target: BlendTarget::for_channel(kind), px: vec![[0.0; 4]; TILE_TEXELS] }
+        Self {
+            kind,
+            target: BlendTarget::for_channel(kind),
+            px: vec![[0.0; 4]; TILE_TEXELS],
+        }
     }
 }
 
 /// Composite all layers of `ts` for one tile. Returns, per texture-set channel (in
 /// `ts.channels` order), the accumulated `[v0, v1, v2, alpha]` texels.
 pub fn evaluate_tile(ts: &TextureSet, tc: &TileContext) -> Vec<(ChannelKind, Vec<[f32; 4]>)> {
+    evaluate_tile_with_cache(ts, tc, None)
+}
+
+pub(crate) fn evaluate_tile_with_cache(
+    ts: &TextureSet,
+    tc: &TileContext,
+    mask_cache: Option<&SharedMaskCache>,
+) -> Vec<(ChannelKind, Vec<[f32; 4]>)> {
     let mut accs: Vec<Acc> = ts.channel_kinds().map(Acc::root).collect();
     let active = vec![true; accs.len()];
-    apply_stack(&ts.layers, &mut accs, &active, tc);
+    apply_stack(&ts.layers, &mut accs, &active, tc, mask_cache);
     accs.into_iter().map(|a| (a.kind, a.px)).collect()
 }
 
-fn apply_stack(layers: &[Arc<Layer>], accs: &mut [Acc], active: &[bool], tc: &TileContext) {
+fn apply_stack(
+    layers: &[Arc<Layer>],
+    accs: &mut [Acc],
+    active: &[bool],
+    tc: &TileContext,
+    mask_cache: Option<&SharedMaskCache>,
+) {
     for layer in layers {
-        apply_layer(layer, accs, active, tc);
+        apply_layer(layer, accs, active, tc, mask_cache);
     }
 }
 
 #[inline]
 fn effective_mode(mode: BlendMode) -> BlendMode {
-    if mode == BlendMode::Passthrough { BlendMode::Normal } else { mode }
+    if mode == BlendMode::Passthrough {
+        BlendMode::Normal
+    } else {
+        mode
+    }
 }
 
-fn apply_layer(layer: &Layer, accs: &mut [Acc], active: &[bool], tc: &TileContext) {
+fn apply_layer(
+    layer: &Layer,
+    accs: &mut [Acc],
+    active: &[bool],
+    tc: &TileContext,
+    mask_cache: Option<&SharedMaskCache>,
+) {
     if !layer.visible {
         return;
     }
     // Channels this layer can affect at all.
-    let live: Vec<bool> = accs.iter().zip(active).map(|(a, &on)| on && layer.blend_for(a.kind).is_active()).collect();
+    let live: Vec<bool> = accs
+        .iter()
+        .zip(active)
+        .map(|(a, &on)| on && layer.blend_for(a.kind).is_active())
+        .collect();
     if !live.contains(&true) {
         return;
     }
-    let mut mask = eval_mask(layer.mask.as_ref(), tc);
+    let mut mask = match mask_cache {
+        Some(cache) => eval_mask_cached(layer.mask.as_ref(), tc, cache),
+        None => eval_mask(layer.mask.as_ref(), tc),
+    };
     // Part mask: the layer only shows on its chosen mesh parts.
     if let Some(parts) = layer.parts.as_ref().filter(|p| p.enabled) {
         if parts.parts.is_empty() {
@@ -82,21 +121,36 @@ fn apply_layer(layer: &Layer, accs: &mut [Acc], active: &[bool], tc: &TileContex
     match &layer.content {
         LayerContent::Paint(paint) => {
             for (acc, _) in accs.iter_mut().zip(&live).filter(|(_, l)| **l) {
-                let Some(img) = paint.channels.get(&acc.kind) else { continue };
+                let Some(img) = paint.channels.get(&acc.kind) else {
+                    continue;
+                };
                 read_tile_rgba(img, tc.geo, &mut content);
                 // Paint images hold `components` values followed by alpha.
                 let n = acc.kind.components();
                 for px in content.iter_mut() {
                     let a = px[n];
-                    *px = if n == 1 { [px[0], px[0], px[0], a] } else { [px[0], px[1], px[2], a] };
+                    *px = if n == 1 {
+                        [px[0], px[0], px[0], a]
+                    } else {
+                        [px[0], px[1], px[2], a]
+                    };
                 }
                 blend_content(acc, &content, layer, &mask_at);
             }
         }
         LayerContent::Fill(fill) => {
             for (acc, _) in accs.iter_mut().zip(&live).filter(|(_, l)| **l) {
-                let Some(ch) = fill.channels.get(&acc.kind).filter(|c| c.enabled) else { continue };
-                eval_fill_tile(&ch.source, acc.kind.is_color(), &fill.projection, tc.geo, &tc.sample, &mut content);
+                let Some(ch) = fill.channels.get(&acc.kind).filter(|c| c.enabled) else {
+                    continue;
+                };
+                eval_fill_tile(
+                    &ch.source,
+                    acc.kind.is_color(),
+                    &fill.projection,
+                    tc.geo,
+                    &tc.sample,
+                    &mut content,
+                );
                 crate::strength::apply_strength(acc.kind, ch.strength, &mut content);
                 if acc.kind.components() == 1 {
                     for px in content.iter_mut() {
@@ -118,7 +172,7 @@ fn apply_layer(layer: &Layer, accs: &mut [Acc], active: &[bool], tc: &TileContex
                     }
                 })
                 .collect();
-            apply_stack(&group.children, &mut child, &live, tc);
+            apply_stack(&group.children, &mut child, &live, tc, mask_cache);
             for ((acc, inner), _) in accs.iter_mut().zip(child).zip(&live).filter(|(_, l)| **l) {
                 let blend = layer.blend_for(acc.kind);
                 if blend.mode == BlendMode::Passthrough {
@@ -126,6 +180,18 @@ fn apply_layer(layer: &Layer, accs: &mut [Acc], active: &[bool], tc: &TileContex
                         let f = (blend.opacity * mask_at(i)).clamp(0.0, 1.0);
                         for c in 0..4 {
                             dst[c] += (src[c] - dst[c]) * f;
+                        }
+                        // Passthrough folders interpolate their completed stack directly,
+                        // bypassing composite(). Unit normals must survive this opacity too.
+                        if acc.target.normal && dst[3] > 0.0 && f > 0.0 && f < 1.0 {
+                            let n = glam::Vec3::new(
+                                dst[0] * 2.0 - 1.0,
+                                dst[1] * 2.0 - 1.0,
+                                dst[2] * 2.0 - 1.0,
+                            )
+                            .normalize_or(glam::Vec3::Z);
+                            dst[..3]
+                                .copy_from_slice(&(n * 0.5 + glam::Vec3::splat(0.5)).to_array());
                         }
                     }
                 } else {
@@ -137,7 +203,12 @@ fn apply_layer(layer: &Layer, accs: &mut [Acc], active: &[bool], tc: &TileContex
 }
 
 /// Composite `(value, alpha)` content onto a channel with the layer's mode, opacity and mask.
-fn blend_content(acc: &mut Acc, content: &[[f32; 4]], layer: &Layer, mask_at: &dyn Fn(usize) -> f32) {
+fn blend_content(
+    acc: &mut Acc,
+    content: &[[f32; 4]],
+    layer: &Layer,
+    mask_at: &dyn Fn(usize) -> f32,
+) {
     let blend = layer.blend_for(acc.kind);
     let mode = effective_mode(blend.mode);
     let ignore_alpha = mode == BlendMode::Replace;

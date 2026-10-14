@@ -2,6 +2,7 @@
 //! thumbnails. Clicking applies the asset through the session (undoable where it edits layers).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use egui::{Color32, RichText, Ui};
@@ -38,11 +39,17 @@ pub fn apply_shelf_item(s: &mut UiState, item: ShelfDrag, now: f64) {
             None => Ok(()),
         },
         ShelfDrag::SmartMask(i) => match s.library.smart_masks.get(i).cloned() {
-            Some(m) => s.session.apply_smart_mask(&m).map_err(|e| format!("{e} (select a layer first)")),
+            Some(m) => s
+                .session
+                .apply_smart_mask(&m)
+                .map_err(|e| format!("{e} (select a layer first)")),
             None => Ok(()),
         },
         ShelfDrag::Texture(i) => match s.textures.items.get(i).map(|t| t.path.clone()) {
-            Some(p) => s.session.add_texture_layer(&p).map(|name| s.set_status(format!("Added \"{name}\" as a fill layer"), now)),
+            Some(p) => s
+                .session
+                .add_texture_layer(&p)
+                .map(|name| s.set_status(format!("Added \"{name}\" as a fill layer"), now)),
             None => Ok(()),
         },
     };
@@ -74,6 +81,7 @@ pub struct ShelfUi {
     pub filter: crate::panels::shelf_filter::ShelfFilter,
     filter_tab: ShelfTab,
     thumbs: HashMap<AssetId, egui::TextureHandle>,
+    failed_thumbs: HashSet<AssetId>,
     sphere: Option<PreviewScene>,
     cube: Option<PreviewScene>,
     renderer: Option<(ViewportRenderer, Option<SceneKind>)>,
@@ -88,6 +96,7 @@ impl Default for ShelfUi {
             filter: Default::default(),
             filter_tab: ShelfTab::SmartMaterials,
             thumbs: HashMap::new(),
+            failed_thumbs: HashSet::new(),
             sphere: None,
             cube: None,
             renderer: None,
@@ -107,7 +116,12 @@ pub struct EnvUi {
 
 impl Default for EnvUi {
     fn default() -> Self {
-        Self { index: 0, rotation_deg: 0.0, intensity: 1.0, uploaded: None }
+        Self {
+            index: 0,
+            rotation_deg: 0.0,
+            intensity: 1.0,
+            uploaded: None,
+        }
     }
 }
 
@@ -123,7 +137,9 @@ pub fn apply_environment(
     device: &subcraft_render::wgpu_api::Device,
     queue: &subcraft_render::wgpu_api::Queue,
 ) {
-    let Some(env) = library.environments.get(index) else { return };
+    let Some(env) = library.environments.get(index) else {
+        return;
+    };
     let rot = rotation_deg.to_radians();
     params.environment.rotation = rot;
     match &env.source {
@@ -144,8 +160,19 @@ pub fn apply_environment(
         }
         EnvironmentSource::Hdri(h) => {
             if *uploaded != Some(env.id) {
-                let levels: Vec<(u32, u32, &[f32])> = h.levels.iter().map(|l| (l.width, l.height, l.rgba.as_slice())).collect();
-                renderer.set_hdri(device, queue, Some(subcraft_render::HdriUpload { levels: &levels, sh: h.sh }));
+                let levels: Vec<(u32, u32, &[f32])> = h
+                    .levels
+                    .iter()
+                    .map(|l| (l.width, l.height, l.rgba.as_slice()))
+                    .collect();
+                renderer.set_hdri(
+                    device,
+                    queue,
+                    Some(subcraft_render::HdriUpload {
+                        levels: &levels,
+                        sh: h.sh,
+                    }),
+                );
                 *uploaded = Some(env.id);
             }
             params.environment.use_hdri = true;
@@ -164,8 +191,15 @@ pub fn apply_environment(
 const TILE: f32 = 88.0;
 
 /// Thumbnail tile: square image with a hairline frame (accent when hovered / selected), name below.
-fn tile(ui: &mut Ui, thumb: Option<&egui::TextureHandle>, name: &str, selected: bool, tooltip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(TILE, TILE + 22.0), egui::Sense::click_and_drag());
+fn tile(
+    ui: &mut Ui,
+    thumb: Option<&egui::TextureHandle>,
+    name: &str,
+    selected: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(TILE, TILE + 22.0), egui::Sense::click_and_drag());
     if resp.dragged()
         && egui::DragAndDrop::has_payload_of_type::<ShelfDrag>(ui.ctx())
         && let Some(p) = ui.ctx().pointer_latest_pos()
@@ -176,8 +210,14 @@ fn tile(ui: &mut Ui, thumb: Option<&egui::TextureHandle>, name: &str, selected: 
             .interactable(false)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new(format!("{}  {name}", crate::icons::PLUS)).color(theme::TEXT));
-                    ui.label(RichText::new("Drop on the model or a layer").small().color(theme::TEXT_FAINT));
+                    ui.label(
+                        RichText::new(format!("{}  {name}", crate::icons::PLUS)).color(theme::TEXT),
+                    );
+                    ui.label(
+                        RichText::new("Drop on the model or a layer")
+                            .small()
+                            .color(theme::TEXT_FAINT),
+                    );
                 });
             });
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -187,10 +227,21 @@ fn tile(ui: &mut Ui, thumb: Option<&egui::TextureHandle>, name: &str, selected: 
     painter.rect_filled(img, 0.0, theme::FIELD);
     match thumb {
         Some(t) => {
-            painter.image(t.id(), img.shrink(1.0), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            painter.image(
+                t.id(),
+                img.shrink(1.0),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
         }
         None => {
-            painter.text(img.center(), egui::Align2::CENTER_CENTER, crate::icons::IMAGE, theme::font(20.0), theme::TEXT_FAINT);
+            painter.text(
+                img.center(),
+                egui::Align2::CENTER_CENTER,
+                crate::icons::IMAGE,
+                theme::font(20.0),
+                theme::TEXT_FAINT,
+            );
         }
     }
     let stroke = if selected {
@@ -201,11 +252,16 @@ fn tile(ui: &mut Ui, thumb: Option<&egui::TextureHandle>, name: &str, selected: 
         egui::Stroke::new(1.0, theme::BORDER)
     };
     painter.rect_stroke(img, 0.0, stroke, egui::StrokeKind::Inside);
-    let color = if selected || resp.hovered() { theme::TEXT } else { theme::TEXT_DIM };
+    let color = if selected || resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::TEXT_DIM
+    };
     let galley = painter.layout(name.to_string(), theme::font(11.0), color, TILE);
     let text_pos = egui::pos2(rect.center().x - galley.size().x / 2.0, img.bottom() + 5.0);
     painter.galley(text_pos, galley, color);
-    resp.on_hover_text(tooltip).on_hover_cursor(egui::CursorIcon::PointingHand)
+    resp.on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Right-click menu of an asset stored in the user library. Returns true if it was removed.
@@ -217,11 +273,17 @@ fn library_menu(
 ) -> bool {
     let mut removed = false;
     resp.context_menu(|ui| {
-        if ui.button(format!("{}  Show in folder", crate::icons::FOLDER_OPEN)).clicked() {
+        if ui
+            .button(format!("{}  Show in folder", crate::icons::FOLDER_OPEN))
+            .clicked()
+        {
             show_in_folder(file);
             ui.close();
         }
-        if ui.button(format!("{}  Remove from library", crate::icons::TRASH)).clicked() {
+        if ui
+            .button(format!("{}  Remove from library", crate::icons::TRASH))
+            .clicked()
+        {
             match lib.map(|l| l.remove(file)) {
                 Some(Ok(())) => removed = true,
                 Some(Err(e)) => *status = Some(e),
@@ -239,12 +301,22 @@ pub fn show_in_folder(path: &std::path::Path) {
     let r = if path.is_dir() {
         std::process::Command::new("explorer").arg(path).spawn()
     } else {
-        std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
     };
     #[cfg(not(windows))]
-    let r = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
-        .arg(if path.is_dir() { path } else { path.parent().unwrap_or(path) })
-        .spawn();
+    let r = std::process::Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    })
+    .arg(if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    })
+    .spawn();
     if let Err(e) = r {
         log::warn!("could not open {}: {e}", path.display());
     }
@@ -254,15 +326,42 @@ pub fn show_in_folder(path: &std::path::Path) {
 fn shelf_tab(ui: &mut Ui, current: &mut ShelfTab, value: ShelfTab, icon: &str, label: &str) {
     let selected = *current == value;
     let text = format!("{icon}  {label}");
-    let color = if selected { theme::TEXT } else { theme::TEXT_FAINT };
-    let galley = ui.painter().layout_no_wrap(text, theme::font_strong(12.0), color);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 16.0, 34.0), egui::Sense::click());
-    let color = if resp.hovered() && !selected { theme::TEXT_DIM } else { color };
-    ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
+    let color = if selected {
+        theme::TEXT
+    } else {
+        theme::TEXT_FAINT
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, theme::font_strong(12.0), color);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 16.0, 34.0),
+        egui::Sense::click(),
+    );
+    let color = if resp.hovered() && !selected {
+        theme::TEXT_DIM
+    } else {
+        color
+    };
+    ui.painter().galley_with_override_text_color(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        color,
+    );
     if selected {
-        ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom()), 0.0, theme::ACCENT);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                rect.right_bottom(),
+            ),
+            0.0,
+            theme::ACCENT,
+        );
     }
-    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+    if resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
         *current = value;
     }
 }
@@ -498,9 +597,8 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
     if let Some(msg) = lib_status {
         state.set_status(msg, now);
     }
-    if state.shelf.tab != ShelfTab::Brushes || state.shelf.thumbs.len() < state.library.alphas.len() {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
-    }
+    // Thumbnail generation schedules another frame only while work is in flight.
+    // A loaded shelf must not keep the entire app repainting at 33 Hz indefinitely.
 }
 
 /// Grayscale bitmap → egui image.
@@ -509,59 +607,99 @@ fn alpha_image(b: &subcraft_image::Bitmap) -> egui::ColorImage {
     let mut px = Vec::with_capacity(n * n);
     for y in 0..n {
         for x in 0..n {
-            let t = b.sample((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32, subcraft_image::Wrap::Clamp, false);
+            let t = b.sample(
+                (x as f32 + 0.5) / n as f32,
+                (y as f32 + 0.5) / n as f32,
+                subcraft_image::Wrap::Clamp,
+                false,
+            );
             let v = (t[0] * t[3]).clamp(0.0, 1.0);
             let g = (40.0 + v * 215.0) as u8;
             px.push(Color32::from_gray(g));
         }
     }
-    egui::ColorImage { size: [n, n], pixels: px, source_size: egui::vec2(n as f32, n as f32) }
+    egui::ColorImage {
+        size: [n, n],
+        pixels: px,
+        source_size: egui::vec2(n as f32, n as f32),
+    }
 }
 
 /// Render one missing thumbnail of the visible tab per frame (keeps the UI responsive).
 fn generate_one_thumbnail(state: &mut UiState, ctx: &egui::Context) {
     // Finish the thumbnail in flight first (the GPU copy is never waited on).
     if let Some((id, pending)) = &state.shelf.pending {
-        let Some(rs) = state.render_state.clone() else { return };
+        let Some(rs) = state.render_state.clone() else {
+            return;
+        };
         match pending.try_take(&rs.device) {
             None => {
-                ctx.request_repaint();
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 return;
             }
             Some(bytes) => {
                 if let Some(bytes) = bytes {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([THUMB as usize, THUMB as usize], &bytes);
-                    let tex = ctx.load_texture(format!("thumb-{id}"), img, egui::TextureOptions::LINEAR);
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [THUMB as usize, THUMB as usize],
+                        &bytes,
+                    );
+                    let tex =
+                        ctx.load_texture(format!("thumb-{id}"), img, egui::TextureOptions::LINEAR);
                     state.shelf.thumbs.insert(*id, tex);
+                } else {
+                    state.shelf.failed_thumbs.insert(*id);
+                    log::warn!("thumbnail readback failed for {id}");
                 }
                 state.shelf.pending = None;
             }
         }
     }
     let lib = &state.library;
-    let missing = |id: &AssetId| !state.shelf.thumbs.contains_key(id);
+    let missing = |id: &AssetId| {
+        !state.shelf.thumbs.contains_key(id) && !state.shelf.failed_thumbs.contains(id)
+    };
     enum Job {
         Alpha(usize),
-        Layer(AssetId, SceneKind, Box<dyn Fn(&subcraft_doc::TextureSet) -> Layer>),
+        Layer(
+            AssetId,
+            SceneKind,
+            Box<dyn Fn(&subcraft_doc::TextureSet) -> Layer>,
+        ),
         Environment(usize),
     }
     let job = match state.shelf.tab {
         // Texture thumbnails come from their own background loader.
         ShelfTab::Textures => None,
-        ShelfTab::Brushes => lib.alphas.iter().position(|a| missing(&a.id)).map(Job::Alpha),
+        ShelfTab::Brushes => lib
+            .alphas
+            .iter()
+            .position(|a| missing(&a.id))
+            .map(Job::Alpha),
         ShelfTab::Materials => lib.materials.iter().find(|m| missing(&m.id)).map(|m| {
             let m = m.clone();
             Job::Layer(m.id, SceneKind::Sphere, Box::new(move |ts| m.build(ts)))
         }),
-        ShelfTab::SmartMaterials => lib.smart_materials.iter().find(|m| missing(&m.id)).map(|m| {
-            let m = m.clone();
-            Job::Layer(m.id, SceneKind::Cube, Box::new(move |ts| m.build(ts)))
-        }),
+        ShelfTab::SmartMaterials => lib
+            .smart_materials
+            .iter()
+            .find(|m| missing(&m.id))
+            .map(|m| {
+                let m = m.clone();
+                Job::Layer(m.id, SceneKind::Cube, Box::new(move |ts| m.build(ts)))
+            }),
         ShelfTab::SmartMasks => lib.smart_masks.iter().find(|m| missing(&m.id)).map(|m| {
             let m = m.clone();
-            Job::Layer(m.id, SceneKind::Cube, Box::new(move |ts| mask_preview_layer(ts, &m.effects)))
+            Job::Layer(
+                m.id,
+                SceneKind::Cube,
+                Box::new(move |ts| mask_preview_layer(ts, &m.effects)),
+            )
         }),
-        ShelfTab::Environments => lib.environments.iter().position(|e| missing(&e.id)).map(Job::Environment),
+        ShelfTab::Environments => lib
+            .environments
+            .iter()
+            .position(|e| missing(&e.id))
+            .map(Job::Environment),
     };
     let Some(job) = job else { return };
     if let Job::Alpha(i) = job {
@@ -575,12 +713,20 @@ fn generate_one_thumbnail(state: &mut UiState, ctx: &egui::Context) {
         };
         let tex = ctx.load_texture(format!("thumb-{}", a.id), img, egui::TextureOptions::LINEAR);
         state.shelf.thumbs.insert(a.id, tex);
+        ctx.request_repaint();
         return;
     }
-    let Some(rs) = state.render_state.clone() else { return };
+    let Some(rs) = state.render_state.clone() else {
+        return;
+    };
     let (id, kind, layer_fn, env_index) = match job {
         Job::Layer(id, k, f) => (id, k, Some(f), None),
-        Job::Environment(i) => (state.library.environments[i].id, SceneKind::Sphere, None, Some(i)),
+        Job::Environment(i) => (
+            state.library.environments[i].id,
+            SceneKind::Sphere,
+            None,
+            Some(i),
+        ),
         Job::Alpha(_) => unreachable!(),
     };
     let scene = match kind {
@@ -595,15 +741,23 @@ fn generate_one_thumbnail(state: &mut UiState, ctx: &egui::Context) {
             let mut l = Layer::new_fill("Chrome", ts);
             if let LayerContent::Fill(f) = &mut l.content {
                 let set = |k| FillChannel::new(FillSource::uniform(k));
-                f.channels.insert(ChannelKind::BaseColor, set(ChannelValue::rgb(0.9, 0.9, 0.9)));
-                f.channels.insert(ChannelKind::Metallic, set(ChannelValue::scalar(1.0)));
-                f.channels.insert(ChannelKind::Roughness, set(ChannelValue::scalar(0.12)));
+                f.channels.insert(
+                    ChannelKind::BaseColor,
+                    set(ChannelValue::rgb(0.9, 0.9, 0.9)),
+                );
+                f.channels
+                    .insert(ChannelKind::Metallic, set(ChannelValue::scalar(1.0)));
+                f.channels
+                    .insert(ChannelKind::Roughness, set(ChannelValue::scalar(0.12)));
             }
             scene.composite(l)
         }
     };
     let mesh = scene.mesh.clone();
-    let (renderer, current) = state.shelf.renderer.get_or_insert_with(|| (ViewportRenderer::new(&rs.device, &rs.queue), None));
+    let (renderer, current) = state
+        .shelf
+        .renderer
+        .get_or_insert_with(|| (ViewportRenderer::new(&rs.device, &rs.queue), None));
     if *current != Some(kind) {
         renderer.set_mesh(&rs.device, &mesh);
         *current = Some(kind);
@@ -618,39 +772,69 @@ fn generate_one_thumbnail(state: &mut UiState, ctx: &egui::Context) {
         SceneKind::Cube => Vec3::new(2.2, 1.9, 2.6),
     };
     let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-    let mut params = ViewParams::new(view, Mat4::perspective_rh(38f32.to_radians(), 1.0, 0.1, 50.0));
+    let mut params = ViewParams::new(
+        view,
+        Mat4::perspective_rh(38f32.to_radians(), 1.0, 0.1, 50.0),
+    );
     params.background = [0.035, 0.036, 0.04];
     if let Some(i) = env_index {
         let mut uploaded = None;
-        apply_environment(&state.library, i, 0.0, 1.0, &mut params, renderer, &mut uploaded, &rs.device, &rs.queue);
+        apply_environment(
+            &state.library,
+            i,
+            0.0,
+            1.0,
+            &mut params,
+            renderer,
+            &mut uploaded,
+            &rs.device,
+            &rs.queue,
+        );
     }
-    let pending = renderer.render(&rs.device, &rs.queue, [THUMB, THUMB], &params).read_rgba8_async(&rs.device, &rs.queue);
+    let pending = renderer
+        .render(&rs.device, &rs.queue, [THUMB, THUMB], &params)
+        .read_rgba8_async(&rs.device, &rs.queue);
     state.shelf.pending = Some((id, pending));
     ctx.request_repaint();
 }
 
 /// White paint shown through a smart mask (for mask thumbnails).
-fn mask_preview_layer(ts: &subcraft_doc::TextureSet, effects: &[subcraft_doc::MaskEffectKind]) -> Layer {
+fn mask_preview_layer(
+    ts: &subcraft_doc::TextureSet,
+    effects: &[subcraft_doc::MaskEffectKind],
+) -> Layer {
     let mut l = Layer::new_fill("Mask preview", ts);
     if let LayerContent::Fill(f) = &mut l.content {
         for c in f.channels.values_mut() {
             c.enabled = false;
         }
-        f.channels.insert(ChannelKind::BaseColor, FillChannel::new(FillSource::uniform(ChannelValue::rgb(0.95, 0.55, 0.2))));
+        f.channels.insert(
+            ChannelKind::BaseColor,
+            FillChannel::new(FillSource::uniform(ChannelValue::rgb(0.95, 0.55, 0.2))),
+        );
     }
     let mut mask = Mask::new(ts.resolution, false);
-    mask.effects = effects.iter().cloned().map(|k| Arc::new(MaskEffect::new(k))).collect();
+    mask.effects = effects
+        .iter()
+        .cloned()
+        .map(|k| Arc::new(MaskEffect::new(k)))
+        .collect();
     l.mask = Some(mask);
     l
 }
 
 /// "Open library folder" (creates it on first use so the user can drop files in).
 fn library_folder_button(ui: &mut Ui, state: &UiState, kind: subcraft_app::assets::UserAssetKind) {
-    let Some(lib) = &state.user_library else { return };
+    let Some(lib) = &state.user_library else {
+        return;
+    };
     let dir = lib.folder(kind);
     if ui
         .button(format!("{}  Library folder", crate::icons::FOLDER_OPEN))
-        .on_hover_text(format!("{}\nFiles here appear in the shelf at startup.", dir.display()))
+        .on_hover_text(format!(
+            "{}\nFiles here appear in the shelf at startup.",
+            dir.display()
+        ))
         .clicked()
     {
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -667,7 +851,10 @@ fn filter_row(state: &mut UiState, ui: &mut Ui) {
         state.shelf.filter_tab = state.shelf.tab;
         state.shelf.filter.chip = Chip::All;
     }
-    let mut chips = vec![(Chip::All, "All".to_string()), (Chip::Mine, "Mine".to_string())];
+    let mut chips = vec![
+        (Chip::All, "All".to_string()),
+        (Chip::Mine, "Mine".to_string()),
+    ];
     if state.shelf.tab == ShelfTab::Materials {
         for c in categories(state.library.materials.iter().map(|m| m.category)) {
             chips.push((Chip::Category(c.clone()), c));
@@ -679,23 +866,48 @@ fn filter_row(state: &mut UiState, ui: &mut Ui) {
             chips.push((Chip::Category(c.clone()), c));
         }
     }
-    egui::Frame::new().inner_margin(egui::Margin { left: theme::PAD, right: theme::PAD, top: 4, bottom: 6 }).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let filter = &mut state.shelf.filter;
-            ui.add(egui::TextEdit::singleline(&mut filter.query).hint_text("Search…").desired_width(180.0));
-            if !filter.query.is_empty() && crate::widgets::icon_button(ui, crate::icons::X, "Clear search").clicked() {
-                filter.query.clear();
-            }
-            ui.add_space(8.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (chip, label) in chips {
-                let selected = filter.chip == chip;
-                let text = RichText::new(label).font(theme::font(11.5)).color(if selected { theme::ACCENT } else { theme::TEXT_DIM });
-                let b = egui::Button::new(text).fill(if selected { theme::ACCENT_SOFT } else { theme::BG_3 }).stroke(egui::Stroke::NONE);
-                if ui.add(b).clicked() {
-                    filter.chip = if selected { Chip::All } else { chip };
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: theme::PAD,
+            right: theme::PAD,
+            top: 4,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let filter = &mut state.shelf.filter;
+                ui.add(
+                    egui::TextEdit::singleline(&mut filter.query)
+                        .hint_text("Search…")
+                        .desired_width(180.0),
+                );
+                if !filter.query.is_empty()
+                    && crate::widgets::icon_button(ui, crate::icons::X, "Clear search").clicked()
+                {
+                    filter.query.clear();
                 }
-            }
+                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (chip, label) in chips {
+                    let selected = filter.chip == chip;
+                    let text = RichText::new(label)
+                        .font(theme::font(11.5))
+                        .color(if selected {
+                            theme::ACCENT
+                        } else {
+                            theme::TEXT_DIM
+                        });
+                    let b = egui::Button::new(text)
+                        .fill(if selected {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::BG_3
+                        })
+                        .stroke(egui::Stroke::NONE);
+                    if ui.add(b).clicked() {
+                        filter.chip = if selected { Chip::All } else { chip };
+                    }
+                }
+            });
         });
-    });
 }

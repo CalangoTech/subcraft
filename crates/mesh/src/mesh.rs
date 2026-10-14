@@ -19,7 +19,10 @@ pub struct Aabb {
 }
 
 impl Aabb {
-    pub const EMPTY: Aabb = Aabb { min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) };
+    pub const EMPTY: Aabb = Aabb {
+        min: Vec3::splat(f32::INFINITY),
+        max: Vec3::splat(f32::NEG_INFINITY),
+    };
 
     pub fn from_points(points: impl IntoIterator<Item = Vec3>) -> Self {
         let mut b = Aabb::EMPTY;
@@ -33,7 +36,10 @@ impl Aabb {
         self.max = self.max.max(p);
     }
     pub fn merge(&self, o: &Aabb) -> Aabb {
-        Aabb { min: self.min.min(o.min), max: self.max.max(o.max) }
+        Aabb {
+            min: self.min.min(o.min),
+            max: self.max.max(o.max),
+        }
     }
     pub fn center(&self) -> Vec3 {
         (self.min + self.max) * 0.5
@@ -109,19 +115,31 @@ impl Mesh {
 
     #[inline]
     pub fn tri(&self, t: usize) -> [u32; 3] {
-        [self.indices[3 * t], self.indices[3 * t + 1], self.indices[3 * t + 2]]
+        [
+            self.indices[3 * t],
+            self.indices[3 * t + 1],
+            self.indices[3 * t + 2],
+        ]
     }
 
     #[inline]
     pub fn tri_positions(&self, t: usize) -> [Vec3; 3] {
         let [a, b, c] = self.tri(t);
-        [self.positions[a as usize], self.positions[b as usize], self.positions[c as usize]]
+        [
+            self.positions[a as usize],
+            self.positions[b as usize],
+            self.positions[c as usize],
+        ]
     }
 
     #[inline]
     pub fn tri_uvs(&self, t: usize) -> [Vec2; 3] {
         let [a, b, c] = self.tri(t);
-        [self.uvs[a as usize], self.uvs[b as usize], self.uvs[c as usize]]
+        [
+            self.uvs[a as usize],
+            self.uvs[b as usize],
+            self.uvs[c as usize],
+        ]
     }
 
     pub fn geometric_normal(&self, t: usize) -> Vec3 {
@@ -134,12 +152,19 @@ impl Mesh {
         let [a, b, c] = self.tri(t).map(|i| i as usize);
         let w = 1.0 - u - v;
         let position = self.positions[a] * w + self.positions[b] * u + self.positions[c] * v;
-        let normal = (self.normals[a] * w + self.normals[b] * u + self.normals[c] * v).normalize_or_zero();
+        let normal =
+            (self.normals[a] * w + self.normals[b] * u + self.normals[c] * v).normalize_or_zero();
         let tangent = self.tangents[a] * w + self.tangents[b] * u + self.tangents[c] * v;
         let tw = if self.tangents[a].w < 0.0 { -1.0 } else { 1.0 };
         let tangent = tangent.truncate().normalize_or_zero().extend(tw);
         let uv = self.uvs[a] * w + self.uvs[b] * u + self.uvs[c] * v;
-        SurfacePoint { position, normal, tangent, uv, geometric_normal: self.geometric_normal(t) }
+        SurfacePoint {
+            position,
+            normal,
+            tangent,
+            uv,
+            geometric_normal: self.geometric_normal(t),
+        }
     }
 
     pub fn submesh_for_material(&self, material: u32) -> Option<&Submesh> {
@@ -193,7 +218,9 @@ pub struct Corner {
 pub enum BuildError {
     #[error("mesh has no valid triangles")]
     NoTriangles,
-    #[error("mesh has no UV coordinates; SubCraft requires UVs to paint (automatic unwrapping is not available yet)")]
+    #[error(
+        "mesh has no UV coordinates; SubCraft requires UVs to paint (automatic unwrapping is not available yet)"
+    )]
     NoUvs,
 }
 
@@ -226,30 +253,52 @@ pub struct BuildStats {
 
 impl MeshBuilder {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), ..Default::default() }
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
     }
 
     /// Get or create a material slot by name.
     pub fn material(&mut self, name: &str) -> u32 {
-        let name = if name.trim().is_empty() { "DefaultMaterial" } else { name };
+        let name = if name.trim().is_empty() {
+            "DefaultMaterial"
+        } else {
+            name
+        };
         if let Some(&i) = self.material_lookup.get(name) {
             return i;
         }
         let i = self.materials.len() as u32;
-        self.materials.push(MaterialSlot { name: name.to_string() });
+        self.materials.push(MaterialSlot {
+            name: name.to_string(),
+        });
         self.material_lookup.insert(name.to_string(), i);
         i
     }
 
-    pub fn push_triangle(&mut self, material: u32, c: [Corner; 3]) {
+    pub fn push_triangle(&mut self, material: u32, mut c: [Corner; 3]) {
         if c.iter().any(|c| !c.position.is_finite()) {
             self.stats.non_finite_dropped += 1;
             return;
         }
-        let area = (c[1].position - c[0].position).cross(c[2].position - c[0].position).length();
+        let area = (c[1].position - c[0].position)
+            .cross(c[2].position - c[0].position)
+            .length();
         if area <= 1e-12 {
             self.stats.degenerate_dropped += 1;
             return;
+        }
+        for corner in &mut c {
+            if corner.uv.is_some_and(|uv| !uv.is_finite()) {
+                corner.uv = None;
+            }
+        }
+        if c.iter().any(|c| {
+            c.normal
+                .is_none_or(|n| !n.is_finite() || n.length_squared() < 1e-12)
+        }) {
+            self.stats.generated_normals = true;
         }
         if c.iter().any(|c| c.uv.is_none()) {
             self.stats.missing_uv_triangles += 1;
@@ -262,12 +311,23 @@ impl MeshBuilder {
         self.tri_material.len()
     }
 
-    pub fn build(mut self) -> Result<Mesh, BuildError> {
+    pub fn build(self) -> Result<Mesh, BuildError> {
+        self.build_for_purpose(true)
+    }
+
+    /// Build a geometry-only source for ray-traced baking. UVs and MikkTSpace frames belong
+    /// to the low-poly target, so a sculpt/high-poly source does not need either. Placeholder
+    /// attributes keep the canonical mesh structurally valid without computing unused tangents.
+    pub fn build_for_baking(self) -> Result<Mesh, BuildError> {
+        self.build_for_purpose(false)
+    }
+
+    fn build_for_purpose(mut self, require_uvs: bool) -> Result<Mesh, BuildError> {
         let tri_count = self.tri_material.len();
         if tri_count == 0 {
             return Err(BuildError::NoTriangles);
         }
-        if self.stats.missing_uv_triangles == tri_count {
+        if require_uvs && self.stats.missing_uv_triangles == tri_count {
             return Err(BuildError::NoUvs);
         }
 
@@ -283,7 +343,10 @@ impl MeshBuilder {
 
         // Normals: fill missing ones with angle-weighted smooth normals over welded positions.
         let mut normals: Vec<Vec3> = Vec::with_capacity(corners.len());
-        let any_missing = corners.iter().any(|c| c.normal.is_none_or(|n| !n.is_finite() || n.length_squared() < 1e-12));
+        let any_missing = corners.iter().any(|c| {
+            c.normal
+                .is_none_or(|n| !n.is_finite() || n.length_squared() < 1e-12)
+        });
         if any_missing {
             self.stats.generated_normals = true;
             let smooth = smooth_corner_normals(&corners);
@@ -294,15 +357,39 @@ impl MeshBuilder {
                 });
             }
         } else {
-            normals.extend(corners.iter().map(|c| c.normal.expect("checked").normalize()));
+            normals.extend(
+                corners
+                    .iter()
+                    .map(|c| c.normal.expect("checked").normalize()),
+            );
         }
-        let uvs: Vec<Vec2> = corners.iter().map(|c| c.uv.unwrap_or(Vec2::ZERO)).collect();
+        let uvs: Vec<Vec2> = corners
+            .iter()
+            .map(|c| {
+                if require_uvs {
+                    c.uv.unwrap_or(Vec2::ZERO)
+                } else {
+                    Vec2::ZERO
+                }
+            })
+            .collect();
         let positions: Vec<Vec3> = corners.iter().map(|c| c.position).collect();
 
-        let tangents = crate::tangent::compute_corner_tangents(&positions, &normals, &uvs);
+        let tangents = if require_uvs {
+            crate::tangent::compute_corner_tangents(&positions, &normals, &uvs)
+        } else {
+            normals
+                .iter()
+                .map(|n| n.any_orthonormal_vector().extend(1.0))
+                .collect()
+        };
 
         // Deduplicate identical corners into shared vertices.
-        let mut mesh = Mesh { name: self.name, materials: self.materials, ..Default::default() };
+        let mut mesh = Mesh {
+            name: self.name,
+            materials: self.materials,
+            ..Default::default()
+        };
         let mut lookup: HashMap<[u32; 12], u32> = HashMap::with_capacity(corners.len());
         mesh.indices.reserve(corners.len());
         for i in 0..corners.len() {
@@ -385,7 +472,12 @@ fn smooth_corner_normals(corners: &[Corner]) -> Vec<Vec3> {
     }
     corners
         .iter()
-        .map(|c| acc.get(&key(c.position)).copied().unwrap_or(Vec3::Y).normalize_or(Vec3::Y))
+        .map(|c| {
+            acc.get(&key(c.position))
+                .copied()
+                .unwrap_or(Vec3::Y)
+                .normalize_or(Vec3::Y)
+        })
         .collect()
 }
 
@@ -394,7 +486,11 @@ mod tests {
     use super::*;
 
     fn corner(p: [f32; 3], uv: [f32; 2]) -> Corner {
-        Corner { position: Vec3::from(p), normal: None, uv: Some(Vec2::from(uv)) }
+        Corner {
+            position: Vec3::from(p),
+            normal: None,
+            uv: Some(Vec2::from(uv)),
+        }
     }
 
     #[test]
@@ -414,11 +510,17 @@ mod tests {
         assert_eq!(mesh.vertex_count(), 4);
         assert_eq!(mesh.triangle_count(), 2);
         for n in &mesh.normals {
-            assert!((n.z - 1.0).abs() < 1e-5, "generated normal should face +Z: {n}");
+            assert!(
+                (n.z - 1.0).abs() < 1e-5,
+                "generated normal should face +Z: {n}"
+            );
         }
         for t in &mesh.tangents {
             assert!((t.truncate().length() - 1.0).abs() < 1e-4);
-            assert!(t.truncate().dot(Vec3::Z).abs() < 1e-4, "tangent must be orthogonal to normal");
+            assert!(
+                t.truncate().dot(Vec3::Z).abs() < 1e-4,
+                "tangent must be orthogonal to normal"
+            );
         }
     }
 
@@ -427,11 +529,24 @@ mod tests {
         let mut b = MeshBuilder::new("t");
         let a = b.material("A");
         let bm = b.material("B");
-        let t = |x: f32| [corner([x, 0.0, 0.0], [0.0, 0.0]), corner([x + 1.0, 0.0, 0.0], [1.0, 0.0]), corner([x, 1.0, 0.0], [0.0, 1.0])];
+        let t = |x: f32| {
+            [
+                corner([x, 0.0, 0.0], [0.0, 0.0]),
+                corner([x + 1.0, 0.0, 0.0], [1.0, 0.0]),
+                corner([x, 1.0, 0.0], [0.0, 1.0]),
+            ]
+        };
         b.push_triangle(bm, t(0.0));
         b.push_triangle(a, t(2.0));
         b.push_triangle(bm, t(4.0));
-        b.push_triangle(a, [corner([0.0; 3], [0.0; 2]), corner([0.0; 3], [0.0; 2]), corner([1.0, 0.0, 0.0], [0.0; 2])]);
+        b.push_triangle(
+            a,
+            [
+                corner([0.0; 3], [0.0; 2]),
+                corner([0.0; 3], [0.0; 2]),
+                corner([1.0, 0.0, 0.0], [0.0; 2]),
+            ],
+        );
         let mesh = b.build().unwrap();
         assert_eq!(mesh.triangle_count(), 3);
         assert_eq!(mesh.submeshes.len(), 2);
@@ -443,8 +558,54 @@ mod tests {
     fn rejects_mesh_without_uvs() {
         let mut b = MeshBuilder::new("t");
         let m = b.material("");
-        let c = |p: [f32; 3]| Corner { position: Vec3::from(p), normal: None, uv: None };
-        b.push_triangle(m, [c([0.0, 0.0, 0.0]), c([1.0, 0.0, 0.0]), c([0.0, 1.0, 0.0])]);
+        let c = |p: [f32; 3]| Corner {
+            position: Vec3::from(p),
+            normal: None,
+            uv: None,
+        };
+        b.push_triangle(
+            m,
+            [c([0.0, 0.0, 0.0]), c([1.0, 0.0, 0.0]), c([0.0, 1.0, 0.0])],
+        );
+        assert!(matches!(b.build(), Err(BuildError::NoUvs)));
+    }
+
+    #[test]
+    fn geometry_only_bake_source_has_valid_normals_without_uvs() {
+        let mut b = MeshBuilder::new("Sculpt");
+        let m = b.material("High");
+        let c = |p: [f32; 3]| Corner {
+            position: Vec3::from(p),
+            normal: None,
+            uv: None,
+        };
+        b.push_triangle(
+            m,
+            [c([0.0, 0.0, 0.0]), c([1.0, 0.0, 0.0]), c([0.0, 1.0, 0.0])],
+        );
+        let high = b.build_for_baking().unwrap();
+        assert!(high.validate().is_empty());
+        assert!(high.normals.iter().all(|n| (*n - Vec3::Z).length() < 1e-6));
+        assert!(
+            high.tangents
+                .iter()
+                .all(|t| (t.truncate().length() - 1.0).abs() < 1e-6)
+        );
+        assert!(high.uvs.iter().all(|uv| *uv == Vec2::ZERO));
+    }
+
+    #[test]
+    fn non_finite_uvs_are_not_a_valid_paint_target() {
+        let mut b = MeshBuilder::new("BrokenUvs");
+        let m = b.material("Low");
+        b.push_triangle(
+            m,
+            [
+                corner([0.0, 0.0, 0.0], [f32::NAN, 0.0]),
+                corner([1.0, 0.0, 0.0], [0.0, 0.0]),
+                corner([0.0, 1.0, 0.0], [0.0, 1.0]),
+            ],
+        );
         assert!(matches!(b.build(), Err(BuildError::NoUvs)));
     }
 }

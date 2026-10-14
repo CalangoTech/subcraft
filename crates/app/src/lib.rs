@@ -10,6 +10,8 @@ pub mod command;
 pub mod images;
 pub mod library;
 pub mod parts;
+pub mod recovery;
+pub mod sampling;
 pub mod session;
 pub mod thumbnails;
 

@@ -38,20 +38,37 @@ try {
     $dist = Join-Path $root 'dist'
     $stage = Join-Path $dist $name
     $zip = Join-Path $dist "$name.zip"
-    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-    if (Test-Path $zip) { Remove-Item $zip -Force }
-    New-Item -ItemType Directory -Path $stage | Out-Null
+    $safeDist = [IO.Path]::GetFullPath($dist).TrimEnd('\') + '\'
+    $safeStage = [IO.Path]::GetFullPath($stage)
+    $safeZip = [IO.Path]::GetFullPath($zip)
+    if (-not $safeStage.StartsWith($safeDist, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $safeZip.StartsWith($safeDist, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Package paths must stay inside the workspace dist directory'
+    }
+    if (Test-Path -LiteralPath $safeZip) { Remove-Item -LiteralPath $safeZip -Force }
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
     $outExe = if ($onWindows) { 'SubCraft.exe' } else { 'SubCraft' }
     Copy-Item $exe (Join-Path $stage $outExe)
-    foreach ($f in 'README.md', 'LICENSE-MIT', 'LICENSE-APACHE') {
+    Set-Content -LiteralPath (Join-Path $stage 'PORTABLE') -Value 'Recovery copies are kept in this portable package.' -Encoding UTF8
+    if (Test-Path -LiteralPath 'dist\Demo_Studio') {
+        Copy-Item -LiteralPath 'dist\Demo_Studio' -Destination $stage -Recurse
+    }
+    foreach ($f in 'README.md', 'COMO_USAR_STUDIO.txt', 'LICENSE-MIT', 'LICENSE-APACHE') {
         Copy-Item $f $stage
     }
     $fonts = Join-Path $stage 'third-party'
-    New-Item -ItemType Directory -Path $fonts | Out-Null
+    New-Item -ItemType Directory -Path $fonts -Force | Out-Null
     Copy-Item 'crates\ui\assets\fonts\*-LICENSE.txt' $fonts
+    $studioDocs = Join-Path $stage 'docs'
+    New-Item -ItemType Directory -Path (Join-Path $studioDocs 'screenshots') -Force | Out-Null
+    Copy-Item 'docs\STUDIO.md' $studioDocs
+    Copy-Item 'docs\screenshots\studio-main.png' (Join-Path $studioDocs 'screenshots')
 
-    Compress-Archive -Path $stage -DestinationPath $zip
+    # Do not package Recovery or projects the user saved alongside the portable exe.
+    $packageItems = @($outExe, 'README.md', 'COMO_USAR_STUDIO.txt', 'LICENSE-MIT', 'LICENSE-APACHE', 'PORTABLE', 'third-party', 'Demo_Studio', 'docs') |
+        ForEach-Object { Join-Path $stage $_ } | Where-Object { Test-Path -LiteralPath $_ }
+    Compress-Archive -LiteralPath $packageItems -DestinationPath $zip
     $size = '{0:N1} MB' -f ((Get-Item $zip).Length / 1MB)
     Write-Host ''
     Write-Host "Done: $zip ($size)" -ForegroundColor Green

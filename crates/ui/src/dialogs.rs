@@ -24,6 +24,7 @@ pub enum Pending {
     NewSample,
     OpenMesh,
     OpenProject,
+    OpenPath,
 }
 
 pub struct ExportUi {
@@ -79,13 +80,16 @@ pub fn save(state: &mut UiState, save_as: bool, now: f64) -> bool {
 }
 
 /// Run an action that replaces the session (after any unsaved-changes prompt).
-pub fn run_pending(state: &mut UiState, action: Pending, ctx: &egui::Context, _now: f64) {
+pub fn run_pending(state: &mut UiState, action: Pending, ctx: &egui::Context, now: f64) {
     match action {
         Pending::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         Pending::NewSample => state.set_session(Session::sample()),
         // In the browser a .gltf can come with its .bin, so meshes allow several files.
         Pending::OpenMesh => crate::files::pick(ctx, crate::files::Purpose::OpenMesh, crate::files::MESHES, cfg!(target_arch = "wasm32"), None),
         Pending::OpenProject => crate::files::pick(ctx, crate::files::Purpose::OpenProject, PROJECT_FILTER, false, None),
+        Pending::OpenPath => {
+            if let Some(path) = state.pending_path.take() { open_project(state, &path, now); }
+        }
     }
 }
 
@@ -306,6 +310,17 @@ pub fn bake_window(state: &mut UiState, ctx: &egui::Context, now: f64) {
                     }
                 });
                 ui.end_row();
+                ui.label(dim("Anti-aliasing"));
+                egui::ComboBox::from_id_salt("bake_aa").selected_text(match b.settings.supersampling {
+                    2 => "4 samples / pixel",
+                    4 => "16 samples / pixel",
+                    _ => "Off (1 sample)",
+                }).show_ui(ui, |ui| {
+                    for (factor, label) in [(1, "Off (1 sample)"), (2, "4 samples / pixel"), (4, "16 samples / pixel")] {
+                        ui.selectable_value(&mut b.settings.supersampling, factor, label);
+                    }
+                }).response.on_hover_text("4 or 16 ray samples per pixel improve detail edges and cost approximately 4× or 16× the work. The sampled resolution is limited to 4096²; the largest jobs can use several GB of RAM.");
+                ui.end_row();
                 ui.label(dim("High poly"));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut b.high_poly).hint_text("optional (none = low on low)").desired_width(220.0));
@@ -316,6 +331,9 @@ pub fn bake_window(state: &mut UiState, ctx: &egui::Context, now: f64) {
                         b.high_poly.clear();
                     }
                 });
+                ui.end_row();
+                ui.label("");
+                hint(ui, "UVs are required on the low poly only. The high poly can be a sculpt without UVs.");
                 ui.end_row();
                 if !b.high_poly.is_empty() {
                     ui.label(dim("Cage front / rear"));
@@ -333,6 +351,12 @@ pub fn bake_window(state: &mut UiState, ctx: &egui::Context, now: f64) {
                 ui.end_row();
                 ui.label(dim("Curvature radius"));
                 ui.add(egui::Slider::new(&mut b.settings.curvature_radius, 0.002..=0.1).logarithmic(true));
+                ui.end_row();
+                ui.label(dim("Thickness samples"));
+                ui.add(egui::Slider::new(&mut b.settings.thickness_samples, 4..=256).logarithmic(true));
+                ui.end_row();
+                ui.label(dim("Thickness distance"));
+                ui.add(egui::Slider::new(&mut b.settings.thickness_distance, 0.01..=1.0).logarithmic(true));
                 ui.end_row();
             });
             ui.add_space(6.0);
@@ -366,7 +390,11 @@ pub fn bake_window(state: &mut UiState, ctx: &egui::Context, now: f64) {
                 });
             }
             None => {
-                let can = !state.bake.settings.maps.is_empty();
+                let validation = state.bake.settings.validate();
+                let can = validation.is_ok();
+                if let Err(error) = validation {
+                    hint(ui, &error.to_string());
+                }
                 let go = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(can, |ui| primary_button(ui, format!("{}  Bake", crate::icons::MAGIC_WAND))).inner.clicked()
                 });

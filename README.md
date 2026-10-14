@@ -1,4 +1,14 @@
-# SubCraft
+# SubCraft Studio
+
+This is the **CalangoTech Studio fork** of [Aalzard/SubCraft](https://github.com/Aalzard/subcraft), based on upstream commit `eb3f374`. Original MIT/Apache-2.0 licensing and attribution are preserved.
+
+Studio adds UV-free high-poly bake import (OBJ/FBX/glTF/GLB), supersampled bakes, draggable and lockable layer trees, inline renaming, spatial mask filters, additional smart assets, material eyedropping, solo-channel inspection, orthographic viewing, workspace presets and background recovery saves. Idle CPU/GPU work is reduced through revision tracking, tile upload snapshots and cached previews. Viewport quality is adjustable independently of texture resolution.
+
+See [the Studio guide and validation](docs/STUDIO.md) or [the Portuguese quick start](COMO_USAR_STUDIO.txt). This remains an early open-source texture painter; full Substance Painter feature parity is not claimed.
+
+![SubCraft Studio workspace](docs/screenshots/studio-main.png)
+
+## Upstream project
 
 [![Try it in your browser](https://img.shields.io/badge/Try%20it-in%20your%20browser-ff7a1a?style=for-the-badge&logo=googlechrome&logoColor=white)](https://aalzard.github.io/subcraft/)
 [![Download for Windows](https://img.shields.io/badge/Download-Windows%20installer-ff7a1a?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Aalzard/subcraft/releases/latest)

@@ -160,6 +160,12 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn linear_from_srgb(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let base = textureSample(t_base, samp, in.uv).rgb;
@@ -168,6 +174,16 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let ntex = textureSample(t_normal, samp, in.uv).rgb * 2.0 - 1.0;
     let emissive = textureSample(t_emissive, samp, in.uv).rgb;
     let ao = clamp(textureSample(t_ao, samp, in.uv).r, 0.0, 1.0);
+    let height = textureSample(t_height, samp, in.uv).r;
+    // Solo channels are inspected without lighting, exposure or the filmic curve.
+    // Data maps are compensated for the sRGB display view so 0.5 reads as mid-gray.
+    let mode = u32(g.env_misc.w + 0.5);
+    if (mode == 1u) { return vec4<f32>(base, 1.0); }
+    if (mode == 2u) { return vec4<f32>(linear_from_srgb(vec3<f32>(clamp(textureSample(t_rough, samp, in.uv).r, 0.0, 1.0))), 1.0); }
+    if (mode == 3u) { return vec4<f32>(linear_from_srgb(vec3<f32>(metal)), 1.0); }
+    if (mode == 4u) { return vec4<f32>(linear_from_srgb(clamp(ntex * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0))), 1.0); }
+    if (mode == 5u) { return vec4<f32>(linear_from_srgb(vec3<f32>(clamp(height * 0.5 + 0.5, 0.0, 1.0))), 1.0); }
+    if (mode == 6u) { return vec4<f32>(linear_from_srgb(vec3<f32>(ao)), 1.0); }
 
     // Height -> tangent-space bump normal (central differences, one texel apart). UV v grows
     // downward while the bitangent points up the image (OpenGL convention), hence +dh/dv for y.

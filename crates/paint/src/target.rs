@@ -19,6 +19,7 @@ pub enum ImageKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaintError {
     LayerNotFound,
+    LayerLocked,
     /// Content strokes need a paint layer.
     NotAPaintLayer,
     NoMask,
@@ -32,6 +33,9 @@ impl std::fmt::Display for PaintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             PaintError::LayerNotFound => "layer not found",
+            PaintError::LayerLocked => {
+                "layer or parent folder is locked; unlock it before painting"
+            }
             PaintError::NotAPaintLayer => "only paint layers can be painted",
             PaintError::NoMask => "layer has no mask",
             PaintError::NothingToPaint => "no enabled brush channel in this texture set",
@@ -54,10 +58,24 @@ pub struct TargetImage {
 }
 
 /// Snapshot the images a stroke will write.
-pub fn begin_targets(ts: &TextureSet, layer: LayerId, target: PaintTarget, material: &BrushMaterial) -> Result<Vec<TargetImage>, PaintError> {
+pub fn begin_targets(
+    ts: &TextureSet,
+    layer: LayerId,
+    target: PaintTarget,
+    material: &BrushMaterial,
+) -> Result<Vec<TargetImage>, PaintError> {
     let l = ts.find(layer).ok_or(PaintError::LayerNotFound)?;
+    if ts.locked_by(layer).is_some() {
+        return Err(PaintError::LayerLocked);
+    }
     let res = ts.resolution;
-    let check = |img: &TiledImage| if img.width() == res && img.height() == res { Ok(()) } else { Err(PaintError::ResolutionMismatch) };
+    let check = |img: &TiledImage| {
+        if img.width() == res && img.height() == res {
+            Ok(())
+        } else {
+            Err(PaintError::ResolutionMismatch)
+        }
+    };
     match target {
         PaintTarget::MaskBase => {
             let mask = l.mask.as_ref().ok_or(PaintError::NoMask)?;
@@ -71,14 +89,34 @@ pub fn begin_targets(ts: &TextureSet, layer: LayerId, target: PaintTarget, mater
             }])
         }
         PaintTarget::Content => {
-            let LayerContent::Paint(paint) = &l.content else { return Err(PaintError::NotAPaintLayer) };
+            let LayerContent::Paint(paint) = &l.content else {
+                return Err(PaintError::NotAPaintLayer);
+            };
             let mut out = Vec::new();
-            for (&kind, ch) in material.channels.iter().filter(|(k, c)| c.enabled && ts.has_channel(**k)) {
-                let snapshot = paint.channels.get(&kind).cloned().unwrap_or_else(|| empty_paint_image(kind, res));
+            for (&kind, ch) in material
+                .channels
+                .iter()
+                .filter(|(k, c)| c.enabled && ts.has_channel(**k))
+            {
+                let snapshot = paint
+                    .channels
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_else(|| empty_paint_image(kind, res));
                 check(&snapshot)?;
                 let n = kind.components();
-                let value = if n == 1 { [ch.value.0[0]; 3] } else { ch.value.0 };
-                out.push(TargetImage { key: ImageKey::Channel(kind), snapshot, value, value_comps: n, has_alpha: true });
+                let value = if n == 1 {
+                    [ch.value.0[0]; 3]
+                } else {
+                    ch.value.0
+                };
+                out.push(TargetImage {
+                    key: ImageKey::Channel(kind),
+                    snapshot,
+                    value,
+                    value_comps: n,
+                    has_alpha: true,
+                });
             }
             if out.is_empty() {
                 return Err(PaintError::NothingToPaint);
@@ -95,7 +133,13 @@ impl TargetImage {
     ///   of premultiplied color toward the brush value; alpha → `a + k(1 − a)`;
     /// * erase: alpha → `a(1 − k)`, value kept;
     /// * mask base (no alpha): `lerp(v, brush, k)`; erasing lerps back toward the mask fill.
-    pub fn compute_tile(&self, tile: usize, cov: &[f32], opacity: f32, mode: StrokeMode) -> Vec<f32> {
+    pub fn compute_tile(
+        &self,
+        tile: usize,
+        cov: &[f32],
+        opacity: f32,
+        mode: StrokeMode,
+    ) -> Vec<f32> {
         let comps = self.snapshot.comps();
         let mut buf = vec![0.0f32; TILE_TEXELS * comps];
         self.snapshot.read_tile(tile, &mut buf);
@@ -117,7 +161,11 @@ impl TargetImage {
                 }
                 (true, StrokeMode::Erase) => px[n] *= 1.0 - k,
                 (false, mode) => {
-                    let to = if mode == StrokeMode::Paint { self.value[0] } else { fill[0] };
+                    let to = if mode == StrokeMode::Paint {
+                        self.value[0]
+                    } else {
+                        fill[0]
+                    };
                     px[0] += (to - px[0]) * k;
                 }
             }
@@ -127,14 +175,28 @@ impl TargetImage {
 }
 
 /// Write computed tiles into the live layer (creating channel images on first use).
-pub fn store(ts: &mut TextureSet, layer: LayerId, writes: &[(ImageKey, usize, Vec<f32>)]) -> Result<(), PaintError> {
+pub fn store(
+    ts: &mut TextureSet,
+    layer: LayerId,
+    writes: &[(ImageKey, usize, Vec<f32>)],
+) -> Result<(), PaintError> {
+    if ts.locked_by(layer).is_some() {
+        return Err(PaintError::LayerLocked);
+    }
     let res = ts.resolution;
     let l = ts.find_mut(layer).ok_or(PaintError::LayerNotFound)?;
     for (key, tile, data) in writes {
         match key {
-            ImageKey::MaskBase => l.mask.as_mut().ok_or(PaintError::NoMask)?.base.write_tile(*tile, data),
+            ImageKey::MaskBase => l
+                .mask
+                .as_mut()
+                .ok_or(PaintError::NoMask)?
+                .base
+                .write_tile(*tile, data),
             ImageKey::Channel(kind) => {
-                let LayerContent::Paint(p) = &mut l.content else { return Err(PaintError::NotAPaintLayer) };
+                let LayerContent::Paint(p) = &mut l.content else {
+                    return Err(PaintError::NotAPaintLayer);
+                };
                 p.channel_mut(*kind, res).write_tile(*tile, data);
             }
         }

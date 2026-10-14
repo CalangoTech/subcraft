@@ -2,7 +2,9 @@
 //! [`Session::execute`](crate::Session::execute); widgets never edit the document directly.
 
 use subcraft_core::{ChannelKind, EffectId, LayerId, TextureSetId};
-use subcraft_doc::{BlendMode, FillChannel, Layer, MaskEffect, MaskEffectKind, PartMask, Projection};
+use subcraft_doc::{
+    BlendMode, FillChannel, Layer, MaskEffect, MaskEffectKind, PartMask, Projection,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NewLayer {
@@ -24,34 +26,93 @@ pub enum Command {
     /// Insert above the selected layer (or at the top) of the selected texture set and select it.
     AddLayer(NewLayer),
     /// Insert a ready-made layer (material preset, smart material) like [`Command::AddLayer`].
-    InsertLayer { layer: Box<Layer>, label: String },
+    InsertLayer {
+        layer: Box<Layer>,
+        label: String,
+    },
     /// Give the layer a black mask (if it has none) and append these effects (smart mask).
-    ApplyMaskEffects { layer: LayerId, effects: Vec<MaskEffectKind>, label: String },
+    ApplyMaskEffects {
+        layer: LayerId,
+        effects: Vec<MaskEffectKind>,
+        label: String,
+    },
     DeleteLayer(LayerId),
     DuplicateLayer(LayerId),
     /// Wrap the layer into a new folder.
     GroupLayer(LayerId),
-    MoveLayer { layer: LayerId, parent: Option<LayerId>, index: usize },
+    MoveLayer {
+        layer: LayerId,
+        parent: Option<LayerId>,
+        index: usize,
+    },
     /// One step up / down among siblings (up = towards the top of the stack).
     MoveUp(LayerId),
     MoveDown(LayerId),
-    SetVisible { layer: LayerId, visible: bool },
-    Rename { layer: LayerId, name: String },
-    SetBlendMode { layer: LayerId, channel: ChannelKind, mode: BlendMode },
+    SetVisible {
+        layer: LayerId,
+        visible: bool,
+    },
+    SetLocked {
+        layer: LayerId,
+        locked: bool,
+    },
+    /// Expand/collapse a folder without changing its material result.
+    SetFolderExpanded {
+        layer: LayerId,
+        expanded: bool,
+    },
+    Rename {
+        layer: LayerId,
+        name: String,
+    },
+    SetBlendMode {
+        layer: LayerId,
+        channel: ChannelKind,
+        mode: BlendMode,
+    },
     /// Coalesces with neighbouring opacity edits of the same layer/channel until [`Command::Seal`].
-    SetBlendOpacity { layer: LayerId, channel: ChannelKind, opacity: f32 },
+    SetBlendOpacity {
+        layer: LayerId,
+        channel: ChannelKind,
+        opacity: f32,
+    },
     /// Coalesces like opacity.
-    SetFillChannel { layer: LayerId, channel: ChannelKind, fill: FillChannel },
-    SetFillProjection { layer: LayerId, projection: Projection },
-    AddMask { layer: LayerId, white: bool },
+    SetFillChannel {
+        layer: LayerId,
+        channel: ChannelKind,
+        fill: FillChannel,
+    },
+    SetFillProjection {
+        layer: LayerId,
+        projection: Projection,
+    },
+    AddMask {
+        layer: LayerId,
+        white: bool,
+    },
     RemoveMask(LayerId),
-    SetMaskEnabled { layer: LayerId, enabled: bool },
-    AddMaskEffect { layer: LayerId, kind: MaskEffectKind },
-    RemoveMaskEffect { layer: LayerId, effect: EffectId },
+    SetMaskEnabled {
+        layer: LayerId,
+        enabled: bool,
+    },
+    AddMaskEffect {
+        layer: LayerId,
+        kind: MaskEffectKind,
+    },
+    RemoveMaskEffect {
+        layer: LayerId,
+        effect: EffectId,
+    },
     /// Replace an effect (matched by id); coalesces while dragging.
-    SetMaskEffect { layer: LayerId, effect: MaskEffect },
+    SetMaskEffect {
+        layer: LayerId,
+        effect: MaskEffect,
+    },
     /// Show the layer only on these mesh parts (`None` = everywhere).
-    SetParts { layer: LayerId, parts: Option<PartMask> },
+    SetParts {
+        layer: LayerId,
+        parts: Option<PartMask>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +121,7 @@ pub enum CommandError {
     TextureSetNotFound,
     NotAFillLayer,
     NoMask,
+    LayerLocked,
     /// A paint stroke is in progress; finish it first.
     StrokeInProgress,
     Invalid(String),
@@ -72,6 +134,9 @@ impl std::fmt::Display for CommandError {
             CommandError::TextureSetNotFound => f.write_str("texture set not found"),
             CommandError::NotAFillLayer => f.write_str("not a fill layer"),
             CommandError::NoMask => f.write_str("layer has no mask"),
+            CommandError::LayerLocked => {
+                f.write_str("layer or parent folder is locked; unlock it before editing")
+            }
             CommandError::StrokeInProgress => f.write_str("a stroke is in progress"),
             CommandError::Invalid(s) => f.write_str(s),
         }

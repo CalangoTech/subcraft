@@ -21,7 +21,13 @@ pub struct Levels {
 
 impl Default for Levels {
     fn default() -> Self {
-        Self { in_low: 0.0, in_high: 1.0, gamma: 1.0, out_low: 0.0, out_high: 1.0 }
+        Self {
+            in_low: 0.0,
+            in_high: 1.0,
+            gamma: 1.0,
+            out_low: 0.0,
+            out_high: 1.0,
+        }
     }
 }
 
@@ -95,15 +101,42 @@ impl Generator {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MaskEffectKind {
     /// Additional paint raster (2 comps: value, alpha).
-    Paint { image: TiledImage },
+    Paint {
+        image: TiledImage,
+    },
     /// Uniform or procedural grayscale fill through a projection.
-    Fill { value: f32, procedural: Option<ProceduralParams>, projection: Projection },
+    Fill {
+        value: f32,
+        procedural: Option<ProceduralParams>,
+        projection: Projection,
+    },
     Generator(Generator),
     Levels(Levels),
     Invert,
+    /// Separable box blur of the accumulated mask. Radius is in texture texels, capped at 32.
+    Blur {
+        radius: u32,
+    },
+    /// Grow white areas with a square maximum filter (texture texels, capped at 32).
+    Dilate {
+        radius: u32,
+    },
+    /// Shrink white areas with a square minimum filter (texture texels, capped at 32).
+    Erode {
+        radius: u32,
+    },
+    /// Linear contrast around `pivot`: 1 is neutral, 0 is flat, >1 increases contrast.
+    Contrast {
+        amount: f32,
+        pivot: f32,
+    },
     /// Grayscale from an imported image through a projection: the image's alpha if it has one
     /// (a logo on a transparent background), else its brightness.
-    Image { resource: subcraft_core::ResourceId, projection: Projection, invert: bool },
+    Image {
+        resource: subcraft_core::ResourceId,
+        projection: Projection,
+        invert: bool,
+    },
 }
 
 impl MaskEffectKind {
@@ -114,7 +147,21 @@ impl MaskEffectKind {
             MaskEffectKind::Generator(g) => format!("Generator ({})", g.kind.label()),
             MaskEffectKind::Levels(_) => "Levels".into(),
             MaskEffectKind::Invert => "Invert".into(),
+            MaskEffectKind::Blur { .. } => "Blur".into(),
+            MaskEffectKind::Dilate { .. } => "Dilate".into(),
+            MaskEffectKind::Erode { .. } => "Erode".into(),
+            MaskEffectKind::Contrast { .. } => "Contrast".into(),
             MaskEffectKind::Image { .. } => "Image".into(),
+        }
+    }
+
+    /// Spatial influence on adjacent texels. Shared by evaluation and incremental invalidation.
+    pub fn spatial_radius(&self) -> u32 {
+        match self {
+            Self::Blur { radius } | Self::Dilate { radius } | Self::Erode { radius } => {
+                (*radius).min(32)
+            }
+            _ => 0,
         }
     }
 }
@@ -131,7 +178,14 @@ pub struct MaskEffect {
 
 impl MaskEffect {
     pub fn new(kind: MaskEffectKind) -> Self {
-        Self { id: EffectId::new(), name: kind.label(), visible: true, blend: BlendMode::Normal, opacity: 1.0, kind }
+        Self {
+            id: EffectId::new(),
+            name: kind.label(),
+            visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            kind,
+        }
     }
 }
 
@@ -146,6 +200,10 @@ pub struct Mask {
 impl Mask {
     pub fn new(resolution: u32, white: bool) -> Self {
         let v = if white { 1.0 } else { 0.0 };
-        Self { enabled: true, base: TiledImage::new(resolution, resolution, 1, [v; 4]), effects: Vec::new() }
+        Self {
+            enabled: true,
+            base: TiledImage::new(resolution, resolution, 1, [v; 4]),
+            effects: Vec::new(),
+        }
     }
 }

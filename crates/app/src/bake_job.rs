@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use subcraft_bake::{BakeInput, BakeSettings, Geometry, Progress, bake};
 use subcraft_core::{MeshMapKind, TextureSetId};
 use subcraft_image::TiledImage;
-use subcraft_mesh::{Bvh, Mesh, import_mesh};
+use subcraft_mesh::{Bvh, Mesh, import_high_poly};
 
 use crate::Session;
 
@@ -49,11 +49,29 @@ impl BakeJob {
         let stage = Arc::new(Mutex::new("Starting".to_string()));
         let (p, done, st) = (progress.clone(), sets_done.clone(), stage.clone());
         subcraft_core::task::spawn(move || {
+            if let Err(error) = request.settings.validate() {
+                let _ = tx.send(Message::Failed(error.to_string()));
+                let _ = tx.send(Message::Finished);
+                return;
+            }
+            if request.texture_sets.is_empty() {
+                let _ = tx.send(Message::Failed(
+                    "no texture sets selected for baking".into(),
+                ));
+                let _ = tx.send(Message::Finished);
+                return;
+            }
             let high = match &request.high_poly {
                 Some(path) => {
-                    *st.lock().expect("stage lock") = format!("Loading high poly {}", path.display());
-                    match import_mesh(path) {
+                    *st.lock().expect("stage lock") =
+                        format!("Loading high poly {}", path.display());
+                    match import_high_poly(path) {
                         Ok(r) => {
+                            if p.is_cancelled() {
+                                let _ = tx.send(Message::Failed("bake cancelled".into()));
+                                let _ = tx.send(Message::Finished);
+                                return;
+                            }
                             *st.lock().expect("stage lock") = "Building high-poly BVH".into();
                             let bvh = Bvh::build(&r.mesh);
                             Some((r.mesh, bvh))
@@ -68,9 +86,20 @@ impl BakeJob {
                 None => None,
             };
             for (i, (ts, slot)) in request.texture_sets.iter().enumerate() {
-                *st.lock().expect("stage lock") = format!("Baking texture set {}/{}", i + 1, request.texture_sets.len());
+                if p.is_cancelled() {
+                    let _ = tx.send(Message::Failed("bake cancelled".into()));
+                    break;
+                }
+                *st.lock().expect("stage lock") = format!(
+                    "Baking texture set {}/{}",
+                    i + 1,
+                    request.texture_sets.len()
+                );
                 let input = BakeInput {
-                    low: Geometry { mesh: &low, bvh: &low_bvh },
+                    low: Geometry {
+                        mesh: &low,
+                        bvh: &low_bvh,
+                    },
                     high: high.as_ref().map(|(m, b)| Geometry { mesh: m, bvh: b }),
                     material_slot: *slot,
                 };
@@ -86,16 +115,26 @@ impl BakeJob {
                     }
                 }
                 done.fetch_add(1, Ordering::Relaxed);
+                p.reset_fraction();
             }
             let _ = tx.send(Message::Finished);
         });
-        Self { progress, sets_done, sets_total, stage, rx, applied: 0, error: None }
+        Self {
+            progress,
+            sets_done,
+            sets_total,
+            stage,
+            rx,
+            applied: 0,
+            error: None,
+        }
     }
 
     /// Overall progress 0..1.
     pub fn fraction(&self) -> f32 {
         let total = self.sets_total.max(1) as f32;
-        ((self.sets_done.load(Ordering::Relaxed) as f32 + self.progress.fraction()) / total).min(1.0)
+        ((self.sets_done.load(Ordering::Relaxed) as f32 + self.progress.fraction()) / total)
+            .min(1.0)
     }
 
     pub fn stage(&self) -> String {
@@ -121,6 +160,10 @@ impl BakeJob {
                 Ok(Message::Finished) | Err(TryRecvError::Disconnected) => {
                     return Some(match self.error.take() {
                         Some(e) if self.applied == 0 => Err(e),
+                        Some(e) => Err(format!(
+                            "{e} ({} of {} texture sets completed)",
+                            self.applied, self.sets_total
+                        )),
                         _ => Ok(self.applied),
                     });
                 }

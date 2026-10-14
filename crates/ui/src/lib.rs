@@ -13,6 +13,7 @@ pub mod state;
 pub mod theme;
 pub mod viewport;
 pub mod widgets;
+pub mod workspace;
 
 pub use app::{LaunchOptions, SubcraftApp, Tab};
 
@@ -21,7 +22,7 @@ pub use app::{LaunchOptions, SubcraftApp, Tab};
 pub fn run(options: LaunchOptions) -> eframe::Result {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SubCraft")
+            .with_title("SubCraft Studio")
             .with_icon(std::sync::Arc::new(theme::app_icon()))
             .with_inner_size([1600.0, 940.0])
             .with_min_inner_size([900.0, 560.0]),
@@ -35,7 +36,7 @@ pub fn run(options: LaunchOptions) -> eframe::Result {
             .map(|_| std::env::temp_dir().join(format!("subcraft-screenshot-state-{}", std::process::id()))),
         ..Default::default()
     };
-    eframe::run_native("SubCraft", native, Box::new(move |cc| Ok(Box::new(SubcraftApp::new(cc, options)))))
+    eframe::run_native("SubCraft Studio", native, Box::new(move |cc| Ok(Box::new(SubcraftApp::new(cc, options)))))
 }
 
 /// Run in a web page, in the `<canvas>` with this id. Files the app writes (projects, exports)

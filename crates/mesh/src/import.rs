@@ -31,8 +31,27 @@ pub struct ImportReport {
 pub const SUPPORTED_EXTENSIONS: [&str; 4] = ["obj", "gltf", "glb", "fbx"];
 
 pub fn import_mesh(path: &Path) -> Result<ImportReport, ImportError> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Mesh").to_string();
+    import_for_purpose(path, true)
+}
+
+/// Import a high-poly bake source. All supported importers accept missing UVs here;
+/// only its positions and normals are used by the ray-traced baker. Paint targets must
+/// continue to use [`import_mesh`], which validates that UVs exist.
+pub fn import_high_poly(path: &Path) -> Result<ImportReport, ImportError> {
+    import_for_purpose(path, false)
+}
+
+fn import_for_purpose(path: &Path, require_uvs: bool) -> Result<ImportReport, ImportError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Mesh")
+        .to_string();
     let mut b = MeshBuilder::new(name);
     let mut warnings = Vec::new();
     match ext.as_str() {
@@ -41,43 +60,79 @@ pub fn import_mesh(path: &Path) -> Result<ImportReport, ImportError> {
         #[cfg(not(target_arch = "wasm32"))]
         "fbx" => load_fbx(path, &mut b, &mut warnings)?,
         #[cfg(target_arch = "wasm32")]
-        "fbx" => return Err(ImportError::Fbx("FBX isn't available in the web version; export the model as glTF / GLB or OBJ".into())),
+        "fbx" => {
+            return Err(ImportError::Fbx(
+                "FBX isn't available in the web version; export the model as glTF / GLB or OBJ"
+                    .into(),
+            ));
+        }
         other => return Err(ImportError::UnsupportedFormat(other.to_string())),
     }
     let stats_pre = b.stats;
-    let mesh = b.build()?;
+    let mesh = if require_uvs {
+        b.build()?
+    } else {
+        b.build_for_baking()?
+    };
     let mut stats = stats_pre;
     stats.generated_normals |= mesh.normals.is_empty();
     if stats.degenerate_dropped > 0 {
-        warnings.push(format!("dropped {} degenerate triangles", stats.degenerate_dropped));
+        warnings.push(format!(
+            "dropped {} degenerate triangles",
+            stats.degenerate_dropped
+        ));
     }
     if stats.non_finite_dropped > 0 {
-        warnings.push(format!("dropped {} triangles with invalid coordinates", stats.non_finite_dropped));
+        warnings.push(format!(
+            "dropped {} triangles with invalid coordinates",
+            stats.non_finite_dropped
+        ));
     }
-    if stats.missing_uv_triangles > 0 {
-        warnings.push(format!("{} triangles have no UVs and cannot be painted", stats.missing_uv_triangles));
+    if require_uvs && stats.missing_uv_triangles > 0 {
+        warnings.push(format!(
+            "{} triangles have no UVs and cannot be painted",
+            stats.missing_uv_triangles
+        ));
     }
     let problems = mesh.validate();
     if !problems.is_empty() {
-        return Err(ImportError::Build(BuildError::NoTriangles)).inspect_err(|_| log::error!("{problems:?}"));
+        return Err(ImportError::Build(BuildError::NoTriangles))
+            .inspect_err(|_| log::error!("{problems:?}"));
     }
-    Ok(ImportReport { mesh, stats, warnings })
+    Ok(ImportReport {
+        mesh,
+        stats,
+        warnings,
+    })
 }
 
-fn load_obj(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Result<(), ImportError> {
-    let opts = tobj::LoadOptions { triangulate: true, single_index: true, ignore_points: true, ignore_lines: true };
+fn load_obj(
+    path: &Path,
+    b: &mut MeshBuilder,
+    warnings: &mut Vec<String>,
+) -> Result<(), ImportError> {
+    let opts = tobj::LoadOptions {
+        triangulate: true,
+        single_index: true,
+        ignore_points: true,
+        ignore_lines: true,
+    };
     // Read through `vfs` (works in the browser too); `.mtl` files resolve next to the OBJ.
-    let bytes = subcraft_core::vfs::read(path).map_err(|e| ImportError::Obj(format!("{}: {e}", path.display())))?;
+    let bytes = subcraft_core::vfs::read(path)
+        .map_err(|e| ImportError::Obj(format!("{}: {e}", path.display())))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (models, materials) = tobj::load_obj_buf(&mut std::io::Cursor::new(bytes), &opts, |mtl| {
-        let mtl_bytes = subcraft_core::vfs::read(&base.join(mtl)).map_err(|_| tobj::LoadError::OpenFileFailed)?;
+        let mtl_bytes = subcraft_core::vfs::read(&base.join(mtl))
+            .map_err(|_| tobj::LoadError::OpenFileFailed)?;
         tobj::load_mtl_buf(&mut std::io::Cursor::new(mtl_bytes))
     })
     .map_err(|e| ImportError::Obj(e.to_string()))?;
     let materials = match materials {
         Ok(m) => m,
         Err(e) => {
-            warnings.push(format!("material library not loaded ({e}); using default material"));
+            warnings.push(format!(
+                "material library not loaded ({e}); using default material"
+            ));
             Vec::new()
         }
     };
@@ -94,8 +149,14 @@ fn load_obj(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
         let corner = |i: u32| {
             let i = i as usize;
             Corner {
-                position: Vec3::new(m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2]),
-                normal: has_n.then(|| Vec3::new(m.normals[3 * i], m.normals[3 * i + 1], m.normals[3 * i + 2])),
+                position: Vec3::new(
+                    m.positions[3 * i],
+                    m.positions[3 * i + 1],
+                    m.positions[3 * i + 2],
+                ),
+                normal: has_n.then(|| {
+                    Vec3::new(m.normals[3 * i], m.normals[3 * i + 1], m.normals[3 * i + 2])
+                }),
                 // OBJ UVs have their origin at the bottom-left.
                 uv: has_uv.then(|| Vec2::new(m.texcoords[2 * i], 1.0 - m.texcoords[2 * i + 1])),
             }
@@ -107,9 +168,21 @@ fn load_obj(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
     Ok(())
 }
 
-fn load_gltf(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Result<(), ImportError> {
+fn load_gltf(
+    path: &Path,
+    b: &mut MeshBuilder,
+    warnings: &mut Vec<String>,
+) -> Result<(), ImportError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let (doc, buffers, _images) = gltf::import(path).map_err(|e| ImportError::Gltf(e.to_string()))?;
+    // Do not decode material textures: geometry import only needs the document and buffers.
+    // Missing source textures must not prevent a sculpt from being used for baking.
+    let (doc, buffers) = {
+        let gltf::Gltf { document, blob } =
+            gltf::Gltf::open(path).map_err(|e| ImportError::Gltf(e.to_string()))?;
+        let buffers = gltf::import_buffers(&document, path.parent(), blob)
+            .map_err(|e| ImportError::Gltf(e.to_string()))?;
+        (document, buffers)
+    };
     #[cfg(target_arch = "wasm32")]
     let (doc, buffers) = gltf_from_vfs(path)?;
     let scene = doc.default_scene().or_else(|| doc.scenes().next());
@@ -117,7 +190,8 @@ fn load_gltf(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Re
         Some(s) => s.nodes().collect(),
         None => doc.nodes().collect(),
     };
-    let mut stack: Vec<(gltf::Node, Mat4)> = roots.into_iter().map(|n| (n, Mat4::IDENTITY)).collect();
+    let mut stack: Vec<(gltf::Node, Mat4)> =
+        roots.into_iter().map(|n| (n, Mat4::IDENTITY)).collect();
     let mut skipped_modes = 0usize;
     while let Some((node, parent)) = stack.pop() {
         let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
@@ -136,11 +210,17 @@ fn load_gltf(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Re
                 };
                 let mat = b.material(&mat_name);
                 let reader = prim.reader(|buf| Some(&buffers[buf.index()]));
-                let Some(pos) = reader.read_positions() else { continue };
+                let Some(pos) = reader.read_positions() else {
+                    continue;
+                };
                 let pos: Vec<Vec3> = pos.map(|p| world.transform_point3(Vec3::from(p))).collect();
-                let nrm: Option<Vec<Vec3>> =
-                    reader.read_normals().map(|it| it.map(|n| (normal_m * Vec3::from(n)).normalize_or_zero()).collect());
-                let uv: Option<Vec<Vec2>> = reader.read_tex_coords(0).map(|t| t.into_f32().map(Vec2::from).collect());
+                let nrm: Option<Vec<Vec3>> = reader.read_normals().map(|it| {
+                    it.map(|n| (normal_m * Vec3::from(n)).normalize_or_zero())
+                        .collect()
+                });
+                let uv: Option<Vec<Vec2>> = reader
+                    .read_tex_coords(0)
+                    .map(|t| t.into_f32().map(Vec2::from).collect());
                 let idx: Vec<u32> = match reader.read_indices() {
                     Some(i) => i.into_u32().collect(),
                     None => (0..pos.len() as u32).collect(),
@@ -149,8 +229,8 @@ fn load_gltf(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Re
                     let i = i as usize;
                     Corner {
                         position: pos[i],
-                        normal: nrm.as_ref().map(|n| n[i]),
-                        uv: uv.as_ref().map(|u| u[i]),
+                        normal: nrm.as_ref().and_then(|n| n.get(i).copied()),
+                        uv: uv.as_ref().and_then(|u| u.get(i).copied()),
                     }
                 };
                 for tri in idx.chunks_exact(3) {
@@ -177,23 +257,34 @@ fn load_gltf(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Re
 #[cfg(target_arch = "wasm32")]
 fn gltf_from_vfs(path: &Path) -> Result<(gltf::Document, Vec<gltf::buffer::Data>), ImportError> {
     let err = |e: String| ImportError::Gltf(e);
-    let bytes = subcraft_core::vfs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
-    let gltf::Gltf { document, mut blob } = gltf::Gltf::from_slice(&bytes).map_err(|e| err(e.to_string()))?;
+    let bytes =
+        subcraft_core::vfs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
+    let gltf::Gltf { document, mut blob } =
+        gltf::Gltf::from_slice(&bytes).map_err(|e| err(e.to_string()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut buffers = Vec::new();
     for b in document.buffers() {
         let mut data = match b.source() {
-            gltf::buffer::Source::Bin => blob.take().ok_or_else(|| err("GLB binary chunk missing".into()))?,
+            gltf::buffer::Source::Bin => blob
+                .take()
+                .ok_or_else(|| err("GLB binary chunk missing".into()))?,
             gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => {
                 return Err(err("embedded (base64) .gltf files aren't supported in the web version; export as .glb".into()));
             }
             gltf::buffer::Source::Uri(uri) => {
                 let file = base.join(uri.replace("%20", " "));
-                subcraft_core::vfs::read(&file).map_err(|_| err(format!("{uri} is missing: upload it together with the .gltf, or export a .glb")))?
+                subcraft_core::vfs::read(&file).map_err(|_| {
+                    err(format!(
+                        "{uri} is missing: upload it together with the .gltf, or export a .glb"
+                    ))
+                })?
             }
         };
         if data.len() < b.length() {
-            return Err(err(format!("buffer {} is shorter than declared", b.index())));
+            return Err(err(format!(
+                "buffer {} is shorter than declared",
+                b.index()
+            )));
         }
         while data.len() % 4 != 0 {
             data.push(0);
@@ -204,17 +295,26 @@ fn gltf_from_vfs(path: &Path) -> Result<(gltf::Document, Vec<gltf::buffer::Data>
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_fbx(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Result<(), ImportError> {
+fn load_fbx(
+    path: &Path,
+    b: &mut MeshBuilder,
+    warnings: &mut Vec<String>,
+) -> Result<(), ImportError> {
     let opts = ufbx::LoadOpts {
         target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
         generate_missing_normals: true,
         ..Default::default()
     };
-    let path_str = path.to_str().ok_or_else(|| ImportError::Fbx("non UTF-8 path".into()))?;
-    let scene = ufbx::load_file(path_str, opts).map_err(|e| ImportError::Fbx(format!("{:?}", e.description)))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| ImportError::Fbx("non UTF-8 path".into()))?;
+    let scene = ufbx::load_file(path_str, opts)
+        .map_err(|e| ImportError::Fbx(format!("{:?}", e.description)))?;
     let mut tri_indices: Vec<u32> = Vec::new();
     for node in scene.nodes.iter() {
-        let Some(mesh) = node.mesh.as_ref() else { continue };
+        let Some(mesh) = node.mesh.as_ref() else {
+            continue;
+        };
         let m = &node.geometry_to_world;
         let nm = ufbx::matrix_for_normals(m);
         let to_v3 = |v: ufbx::Vec3| Vec3::new(v.x as f32, v.y as f32, v.z as f32);
@@ -224,7 +324,8 @@ fn load_fbx(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
             warnings.push(format!("FBX mesh '{}' has no UVs", node.element.name));
         }
         let flip = {
-            let det = m.m00 * (m.m11 * m.m22 - m.m12 * m.m21) - m.m01 * (m.m10 * m.m22 - m.m12 * m.m20)
+            let det = m.m00 * (m.m11 * m.m22 - m.m12 * m.m21)
+                - m.m01 * (m.m10 * m.m22 - m.m12 * m.m20)
                 + m.m02 * (m.m10 * m.m21 - m.m11 * m.m20);
             det < 0.0
         };
@@ -233,7 +334,10 @@ fn load_fbx(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
                 "DefaultMaterial".to_string()
             } else {
                 let mi = mesh.face_material[fi] as usize;
-                mesh.materials.get(mi).map(|mat| mat.element.name.to_string()).unwrap_or_else(|| format!("material_{mi}"))
+                mesh.materials
+                    .get(mi)
+                    .map(|mat| mat.element.name.to_string())
+                    .unwrap_or_else(|| format!("material_{mi}"))
             };
             let mat = b.material(&mat_name);
             let n = ufbx::triangulate_face_vec(&mut tri_indices, mesh, *face);
@@ -242,7 +346,10 @@ fn load_fbx(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
                     let ix = ix as usize;
                     Corner {
                         position: to_v3(ufbx::transform_position(m, mesh.vertex_position[ix])),
-                        normal: has_n.then(|| to_v3(ufbx::transform_direction(&nm, mesh.vertex_normal[ix])).normalize_or_zero()),
+                        normal: has_n.then(|| {
+                            to_v3(ufbx::transform_direction(&nm, mesh.vertex_normal[ix]))
+                                .normalize_or_zero()
+                        }),
                         // FBX UVs have their origin at the bottom-left.
                         uv: has_uv.then(|| {
                             let uv = mesh.vertex_uv[ix];
@@ -250,7 +357,11 @@ fn load_fbx(path: &Path, b: &mut MeshBuilder, warnings: &mut Vec<String>) -> Res
                         }),
                     }
                 };
-                let c = [corner(tri_indices[3 * t]), corner(tri_indices[3 * t + 1]), corner(tri_indices[3 * t + 2])];
+                let c = [
+                    corner(tri_indices[3 * t]),
+                    corner(tri_indices[3 * t + 1]),
+                    corner(tri_indices[3 * t + 2]),
+                ];
                 b.push_triangle(mat, if flip { [c[0], c[2], c[1]] } else { c });
             }
         }
@@ -265,7 +376,14 @@ pub fn write_obj(mesh: &Mesh, path: &Path) -> std::io::Result<()> {
     let mtl_path = path.with_extension("mtl");
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(f, "# SubCraft OBJ export")?;
-    writeln!(f, "mtllib {}", mtl_path.file_name().and_then(|s| s.to_str()).unwrap_or("mesh.mtl"))?;
+    writeln!(
+        f,
+        "mtllib {}",
+        mtl_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mesh.mtl")
+    )?;
     for p in &mesh.positions {
         writeln!(f, "v {} {} {}", p.x, p.y, p.z)?;
     }
@@ -308,11 +426,25 @@ mod tests {
         write_obj(&src, &path).unwrap();
         let rep = import_mesh(&path).unwrap();
         let m = rep.mesh;
-        assert_eq!(m.materials.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["Body", "Trim"]);
+        assert_eq!(
+            m.materials
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Body", "Trim"]
+        );
         assert_eq!(m.triangle_count(), src.triangle_count());
         // UV orientation survives the OBJ v-flip round trip.
-        let mut a: Vec<_> = src.uvs.iter().map(|u| ((u.x * 1e4).round() as i64, (u.y * 1e4).round() as i64)).collect();
-        let mut b: Vec<_> = m.uvs.iter().map(|u| ((u.x * 1e4).round() as i64, (u.y * 1e4).round() as i64)).collect();
+        let mut a: Vec<_> = src
+            .uvs
+            .iter()
+            .map(|u| ((u.x * 1e4).round() as i64, (u.y * 1e4).round() as i64))
+            .collect();
+        let mut b: Vec<_> = m
+            .uvs
+            .iter()
+            .map(|u| ((u.x * 1e4).round() as i64, (u.y * 1e4).round() as i64))
+            .collect();
         a.sort();
         a.dedup();
         b.sort();
@@ -348,25 +480,41 @@ mod tests {
         let rep = import_mesh(&path).unwrap();
         assert_eq!(rep.mesh.triangle_count(), 1);
         assert_eq!(rep.mesh.materials[0].name, "Painted");
-        assert!((rep.mesh.bounds.min.z - 1.0).abs() < 1e-6, "node transform applied");
+        assert!(
+            (rep.mesh.bounds.min.z - 1.0).abs() < 1e-6,
+            "node transform applied"
+        );
         assert!(rep.mesh.normals.iter().all(|n| (n.z - 1.0).abs() < 1e-5));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn unsupported_extension() {
-        assert!(matches!(import_mesh(Path::new("x.stl")), Err(ImportError::UnsupportedFormat(_))));
+        assert!(matches!(
+            import_mesh(Path::new("x.stl")),
+            Err(ImportError::UnsupportedFormat(_))
+        ));
     }
 
     fn base64_encode(data: &[u8]) -> String {
         const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut s = String::new();
         for c in data.chunks(3) {
-            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            let n = (c[0] as u32) << 16
+                | (*c.get(1).unwrap_or(&0) as u32) << 8
+                | *c.get(2).unwrap_or(&0) as u32;
             s.push(T[(n >> 18) as usize & 63] as char);
             s.push(T[(n >> 12) as usize & 63] as char);
-            s.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-            s.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+            s.push(if c.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            s.push(if c.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         s
     }

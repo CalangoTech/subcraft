@@ -14,6 +14,7 @@ pub struct OrbitCamera {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y_deg: f32,
+    pub orthographic: bool,
     /// Scene scale for clip planes.
     pub scene_radius: f32,
 }
@@ -29,6 +30,7 @@ impl OrbitCamera {
             pitch: 22f32.to_radians(),
             distance: radius / (fov.to_radians() * 0.5).sin() * 1.1,
             fov_y_deg: fov,
+            orthographic: false,
             scene_radius: radius,
         }
     }
@@ -44,18 +46,40 @@ impl OrbitCamera {
     }
 
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        let near = (self.distance - self.scene_radius * 2.0).max(self.distance * 0.01).max(1e-4);
+        let near = (self.distance - self.scene_radius * 2.0)
+            .max(self.distance * 0.01)
+            .max(1e-4);
         let far = self.distance + self.scene_radius * 4.0;
-        Mat4::perspective_rh(self.fov_y_deg.to_radians(), aspect.max(1e-3), near, far)
+        if self.orthographic {
+            let half_height = self.distance * (self.fov_y_deg.to_radians() * 0.5).tan();
+            let half_width = half_height * aspect.max(1e-3);
+            Mat4::orthographic_rh(
+                -half_width,
+                half_width,
+                -half_height,
+                half_height,
+                near,
+                far,
+            )
+        } else {
+            Mat4::perspective_rh(self.fov_y_deg.to_radians(), aspect.max(1e-3), near, far)
+        }
     }
 
     /// Paint camera for a viewport of `size` physical pixels.
     pub fn paint_camera(&self, size: [u32; 2]) -> Camera {
-        Camera { view: self.view(), proj: self.proj(size[0] as f32 / size[1].max(1) as f32), viewport: size }
+        Camera {
+            view: self.view(),
+            proj: self.proj(size[0] as f32 / size[1].max(1) as f32),
+            viewport: size,
+        }
     }
 
     pub fn view_params(&self, size: [u32; 2]) -> ViewParams {
-        let mut p = ViewParams::new(self.view(), self.proj(size[0] as f32 / size[1].max(1) as f32));
+        let mut p = ViewParams::new(
+            self.view(),
+            self.proj(size[0] as f32 / size[1].max(1) as f32),
+        );
         // Key light follows the camera loosely (over the viewer's right shoulder).
         let (sy, cy) = (self.yaw + 0.6).sin_cos();
         p.light_dir = Vec3::new(sy * 0.6, 0.75, cy * 0.6).normalize();
@@ -69,7 +93,8 @@ impl OrbitCamera {
 
     /// Pan by a screen delta in pixels (keeps the point under the cursor fixed at the target depth).
     pub fn pan(&mut self, dx: f32, dy: f32, viewport_height: f32) {
-        let units_per_px = 2.0 * self.distance * (self.fov_y_deg.to_radians() * 0.5).tan() / viewport_height.max(1.0);
+        let units_per_px = 2.0 * self.distance * (self.fov_y_deg.to_radians() * 0.5).tan()
+            / viewport_height.max(1.0);
         let view = self.view().inverse();
         let right = view.x_axis.truncate();
         let up = view.y_axis.truncate();
@@ -77,7 +102,8 @@ impl OrbitCamera {
     }
 
     pub fn zoom(&mut self, factor: f32) {
-        self.distance = (self.distance * factor).clamp(self.scene_radius * 0.05, self.scene_radius * 50.0);
+        self.distance =
+            (self.distance * factor).clamp(self.scene_radius * 0.05, self.scene_radius * 50.0);
     }
 }
 
@@ -87,12 +113,23 @@ mod tests {
 
     #[test]
     fn framing_sees_the_whole_box_and_paint_camera_matches_render() {
-        let b = Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) };
+        let b = Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        };
         let cam = OrbitCamera::framing(&b);
         let pc = cam.paint_camera([800, 600]);
-        for corner in [b.min, b.max, Vec3::new(1.0, -1.0, 1.0), Vec3::new(-1.0, 1.0, -1.0)] {
+        for corner in [
+            b.min,
+            b.max,
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+        ] {
             let s = pc.project(corner).unwrap();
-            assert!(s.x > 0.0 && s.x < 800.0 && s.y > 0.0 && s.y < 600.0, "{corner} -> {s}");
+            assert!(
+                s.x > 0.0 && s.x < 800.0 && s.y > 0.0 && s.y < 600.0,
+                "{corner} -> {s}"
+            );
         }
         let vp = cam.view_params([800, 600]);
         assert_eq!(vp.proj * vp.view, pc.view_proj());
@@ -100,7 +137,10 @@ mod tests {
 
     #[test]
     fn orbit_pan_zoom() {
-        let b = Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) };
+        let b = Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        };
         let mut cam = OrbitCamera::framing(&b);
         let d = cam.distance;
         cam.zoom(0.5);
@@ -111,5 +151,26 @@ mod tests {
         cam.pan(10.0, 0.0, 600.0);
         assert!(cam.target != t);
         assert!((cam.eye() - cam.target).length() - cam.distance < 1e-4);
+    }
+
+    #[test]
+    fn orthographic_projection_matches_paint_and_has_no_perspective_shrink() {
+        let b = Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        };
+        let mut cam = OrbitCamera::framing(&b);
+        cam.orthographic = true;
+        let pc = cam.paint_camera([800, 600]);
+        assert!(pc.is_orthographic());
+        assert_eq!(
+            pc.view_proj(),
+            cam.view_params([800, 600]).proj * cam.view()
+        );
+        assert!((pc.pixels_per_unit(1.0) - pc.pixels_per_unit(50.0)).abs() < 1e-6);
+        let point = b.center();
+        let projected = pc.project(point).unwrap();
+        let (origin, direction) = pc.ray(projected.truncate());
+        assert!((origin + direction * (point - origin).dot(direction)).distance(point) < 1e-3);
     }
 }

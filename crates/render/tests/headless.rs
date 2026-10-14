@@ -9,6 +9,27 @@ use subcraft_render::{ViewParams, ViewportRenderer, headless};
 
 const SIZE: u32 = 192;
 
+#[test]
+fn solo_channels_display_data_without_lighting_or_exposure() {
+    use subcraft_render::ViewMode;
+    let Some((_, device, queue)) = headless::device() else { return };
+    let mut p = params();
+    p.exposure = 16.0;
+    p.light_intensity = 100.0;
+    p.view_mode = ViewMode::Roughness;
+    let image = render_with(&device, &queue, &[(ChannelKind::Roughness, solid(1, [0.5; 4]))], &p);
+    let center = px(&image, SIZE / 2, SIZE / 2);
+    assert!((center[0] as i32 - 128).abs() <= 2, "data must display at its encoded value: {center:?}");
+    assert_eq!(center[0], center[1]);
+    p.view_mode = ViewMode::BaseColor;
+    let image = render_with(&device, &queue, &[(ChannelKind::BaseColor, solid(4, [0.2, 0.4, 0.6, 1.0]))], &p);
+    let center = px(&image, SIZE / 2, SIZE / 2);
+    for (actual, linear) in center[..3].iter().zip([0.2, 0.4, 0.6]) {
+        let expected = (subcraft_core::color::linear_to_srgb(linear) * 255.0).round() as i32;
+        assert!((*actual as i32 - expected).abs() <= 2);
+    }
+}
+
 fn params() -> ViewParams {
     let view = Mat4::look_at_rh(Vec3::new(3.0, 2.5, 4.0), Vec3::ZERO, Vec3::Y);
     let proj = Mat4::perspective_rh(45f32.to_radians(), 1.0, 0.1, 100.0);

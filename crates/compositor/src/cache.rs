@@ -45,8 +45,14 @@ impl CompositeCache {
     /// Bring the composite up to date with `ts`; returns the re-evaluated tile indices (sorted).
     pub fn update(&mut self, ts: &TextureSet, ctx: &EvalContext) -> Vec<usize> {
         let reusable = !self.force_all
-            && self.composite.as_ref().is_some_and(|c| c.resolution == ts.resolution)
-            && self.last.as_ref().is_some_and(|l| l.id == ts.id && l.channels == ts.channels);
+            && self
+                .composite
+                .as_ref()
+                .is_some_and(|c| c.resolution == ts.resolution)
+            && self
+                .last
+                .as_ref()
+                .is_some_and(|l| l.id == ts.id && l.channels == ts.channels);
         let dirty = match (&self.last, reusable) {
             (Some(last), true) => diff_lists(&last.layers, &ts.layers),
             _ => Dirty::All,
@@ -70,7 +76,11 @@ impl CompositeCache {
 
 fn diff_lists(old: &[Arc<Layer>], new: &[Arc<Layer>]) -> Dirty {
     let mut tiles = BTreeSet::new();
-    if collect_list(old, new, &mut tiles) { Dirty::Tiles(tiles) } else { Dirty::All }
+    if collect_list(old, new, &mut tiles) {
+        Dirty::Tiles(tiles)
+    } else {
+        Dirty::All
+    }
 }
 
 /// Adds raster-changed tiles to `out`; returns false if the change is not raster-only.
@@ -86,7 +96,42 @@ fn collect_list(old: &[Arc<Layer>], new: &[Arc<Layer>], out: &mut BTreeSet<usize
             return false;
         }
         if let (Some(ma), Some(mb)) = (&a.mask, &b.mask) {
-            out.extend(ma.base.changed_tiles(&mb.base));
+            let changed = ma.base.changed_tiles(&mb.base);
+            // A stack of spatial mask filters propagates changes by the sum of its radii.
+            // Grow only mask-raster dirtiness; ordinary paint channels remain tile-local.
+            let radius = mb
+                .effects
+                .iter()
+                .filter(|e| e.visible && e.opacity > 0.0)
+                .fold(0u32, |r, e| r.saturating_add(e.kind.spatial_radius()))
+                .min(mb.base.width());
+            if radius == 0 {
+                out.extend(changed);
+            } else {
+                let size = subcraft_image::TILE_SIZE;
+                let tiles_x = mb.base.width().div_ceil(size);
+                for tile in changed {
+                    let x0 = tile as u32 % tiles_x * size;
+                    let y0 = tile as u32 / tiles_x * size;
+                    let tx0 = x0.saturating_sub(radius) / size;
+                    let ty0 = y0.saturating_sub(radius) / size;
+                    let tx1 = x0
+                        .saturating_add(size - 1)
+                        .saturating_add(radius)
+                        .min(mb.base.width() - 1)
+                        / size;
+                    let ty1 = y0
+                        .saturating_add(size - 1)
+                        .saturating_add(radius)
+                        .min(mb.base.height() - 1)
+                        / size;
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            out.insert((ty * tiles_x + tx) as usize);
+                        }
+                    }
+                }
+            }
         }
         match (&a.content, &b.content) {
             (LayerContent::Paint(pa), LayerContent::Paint(pb)) => {
@@ -96,11 +141,19 @@ fn collect_list(old: &[Arc<Layer>], new: &[Arc<Layer>], out: &mut BTreeSet<usize
                         None => out.extend(ia.changed_tiles(&empty_paint_image(*kind, ia.width()))),
                     }
                 }
-                for (kind, ib) in pb.channels.iter().filter(|(k, _)| !pa.channels.contains_key(k)) {
+                for (kind, ib) in pb
+                    .channels
+                    .iter()
+                    .filter(|(k, _)| !pa.channels.contains_key(k))
+                {
                     out.extend(ib.changed_tiles(&empty_paint_image(*kind, ib.width())));
                 }
             }
-            (LayerContent::Group(ga), LayerContent::Group(gb)) if !collect_list(&ga.children, &gb.children, out) => return false,
+            (LayerContent::Group(ga), LayerContent::Group(gb))
+                if !collect_list(&ga.children, &gb.children, out) =>
+            {
+                return false;
+            }
             _ => {}
         }
     }

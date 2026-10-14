@@ -3,3 +3,6 @@
 /scratch
 /preview_out
 /dist
+/.tools
+/.qa
+/.qa*.log

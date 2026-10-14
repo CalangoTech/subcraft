@@ -2,6 +2,21 @@
 
 Last updated: 2026-10-14 (session 21: stencils)
 
+## Studio fork — 2026-10-14
+
+The CalangoTech fork adds UVless high-poly import, supersampled baking, layer dragging/locking,
+inline naming, spatial mask filters, additional smart assets, material eyedropping, viewer tools,
+background recovery and bounded/correct CPU/GPU caches. Full details, constraints, commands and
+measured benchmarks are in [STUDIO.md](STUDIO.md).
+
+Validated on Windows: **255 tests passed**, 2 manual benchmarks ignored by default; native DX12
+startup and screenshot on RTX 3060; real OBJ high poly without UVs (4032 triangles), 14 baked maps,
+painting/filtering/layer undo/redo/locking, project save/reopen comparisons and 24 decoded PNG
+exports across PBR/Unity HDRP/Unreal. Optimized portable executable built successfully.
+
+The upstream progress history below is retained for reference; the older test counts describe
+their respective milestones. Feature parity with Substance Painter remains a longer-term effort.
+
 ## Decisions
 
 * Stack: Rust 2024 + wgpu 30 + egui 0.36/eframe + egui_dock 0.21 — see `adr/0001-technology-stack.md`.

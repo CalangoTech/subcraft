@@ -21,10 +21,26 @@ pub struct Texel {
 
 /// All covered texels of `material_slot` at `size`² (inside texels win over rim texels).
 pub fn texels(mesh: &Mesh, material_slot: u32, size: u32) -> Vec<Texel> {
+    texels_cancellable(mesh, material_slot, size, || false).unwrap_or_default()
+}
+
+/// Build surface samples while allowing background jobs to stop during UV rasterization.
+pub fn texels_cancellable(
+    mesh: &Mesh,
+    material_slot: u32,
+    size: u32,
+    cancelled: impl Fn() -> bool,
+) -> Option<Vec<Texel>> {
+    if cancelled() {
+        return None;
+    }
     let n = (size * size) as usize;
     let mut best: Vec<(f32, u32, [f32; 3])> = vec![(f32::INFINITY, u32::MAX, [0.0; 3]); n];
     let full = IRect::from_size(size, size);
     for t in mesh.material_triangles(material_slot) {
+        if cancelled() {
+            return None;
+        }
         let uv: [Vec2; 3] = mesh.tri_uvs(t);
         raster_triangle(uv, size, size, full, BAKE_EXPAND, |h| {
             let i = (h.y as u32 * size + h.x as u32) as usize;
@@ -34,21 +50,26 @@ pub fn texels(mesh: &Mesh, material_slot: u32, size: u32) -> Vec<Texel> {
             }
         });
     }
-    best.iter()
-        .enumerate()
-        .filter(|(_, b)| b.1 != u32::MAX)
-        .map(|(i, &(_, tri, bary))| {
-            let sp = mesh.interpolate(tri as usize, bary[1], bary[2]);
-            Texel {
-                index: i as u32,
-                tri,
-                position: sp.position,
-                normal: sp.normal,
-                tangent: sp.tangent,
-                geometric_normal: sp.geometric_normal,
-            }
-        })
-        .collect()
+    if cancelled() {
+        return None;
+    }
+    Some(
+        best.iter()
+            .enumerate()
+            .filter(|(_, b)| b.1 != u32::MAX)
+            .map(|(i, &(_, tri, bary))| {
+                let sp = mesh.interpolate(tri as usize, bary[1], bary[2]);
+                Texel {
+                    index: i as u32,
+                    tri,
+                    position: sp.position,
+                    normal: sp.normal,
+                    tangent: sp.tangent,
+                    geometric_normal: sp.geometric_normal,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Deterministic per-texel random number in [0, 1).

@@ -6,29 +6,46 @@ use egui::{RichText, Ui};
 use subcraft_app::Command;
 use subcraft_core::{ChannelKind, ChannelValue, MeshMapKind};
 use subcraft_doc::{
-    FillChannel, FillSource, Generator, GeneratorKind, LayerContent, Levels, MaskEffect, MaskEffectKind, ProceduralKind,
-    PartMask, ProceduralParams, Projection, ProjectionMode,
+    FillChannel, FillSource, Generator, GeneratorKind, LayerContent, Levels, MaskEffect,
+    MaskEffectKind, PartMask, ProceduralKind, ProceduralParams, Projection, ProjectionMode,
 };
 
 use crate::icons;
 use crate::state::UiState;
 use crate::theme::{self, ACCENT, BG_2, TEXT_DIM, TEXT_FAINT};
-use crate::widgets::{channel_value, empty_state, fill_width, hint, icon_button, panel, primary_button, prop_row, secondary_button, section, section_with, segmented, slider_row};
+use crate::widgets::{
+    channel_value, empty_state, fill_width, hint, icon_button, panel, primary_button, prop_row,
+    secondary_button, section, section_with, segmented, slider_row,
+};
 
 pub fn show(state: &mut UiState, ui: &mut Ui) {
     let now = ui.input(|i| i.time);
     let Some(layer) = state.session.selected_layer().cloned() else {
-        panel(ui, |ui| empty_state(ui, icons::SLIDERS, "Select a layer to edit its properties."));
+        panel(ui, |ui| {
+            empty_state(ui, icons::SLIDERS, "Select a layer to edit its properties.")
+        });
         return;
     };
     let mut cmds = Vec::new();
     let mut texture_drop: Option<(ChannelKind, std::path::PathBuf)> = None;
     let id = layer.id;
+    let locked = state.session.selected_texture_set().locked_by(id);
+    if let Some(owner) = locked {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Layer content is locked").color(theme::WARNING));
+            if ui.button("Unlock").clicked() {
+                cmds.push(Command::SetLocked {
+                    layer: owner,
+                    locked: false,
+                });
+            }
+        });
+    }
     let channels = state.session.channels();
     let mesh_parts = state.session.mesh_parts();
     let mut picking = state.picking_parts;
 
-    egui::ScrollArea::vertical().id_salt("props").auto_shrink([false, false]).show(ui, |ui| panel(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("props").auto_shrink([false, false]).show(ui, |ui| ui.add_enabled_ui(locked.is_none(), |ui| panel(ui, |ui| {
         // Name, with the layer type as an icon.
         ui.horizontal(|ui| {
             let icon = match &layer.content {
@@ -38,6 +55,13 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
             };
             ui.label(RichText::new(icon).font(theme::font(18.0)).color(ACCENT));
             fill_width(ui);
+            let editor_id = ui.id().with("layer-name");
+            let source_id = editor_id.with("source");
+            let source_changed = ui.data(|d| d.get_temp::<String>(source_id)).as_deref() != Some(layer.name.as_str());
+            if source_changed && !ui.memory(|m| m.has_focus(editor_id)) {
+                state.rename = Some((id, layer.name.clone()));
+                ui.data_mut(|d| d.insert_temp(source_id, layer.name.clone()));
+            }
             let buf = match &mut state.rename {
                 Some((lid, s)) if *lid == id => s,
                 slot => {
@@ -45,7 +69,7 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
                     &mut slot.as_mut().expect("just set").1
                 }
             };
-            let r = ui.add(egui::TextEdit::singleline(buf).font(theme::font_strong(14.0)).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
+            let r = ui.add(egui::TextEdit::singleline(buf).id(editor_id).font(theme::font_strong(14.0)).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
             if r.lost_focus() && *buf != layer.name && !buf.trim().is_empty() {
                 cmds.push(Command::Rename { layer: id, name: buf.trim().to_string() });
             }
@@ -324,6 +348,10 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
                         );
                         add(ui, "Levels", MaskEffectKind::Levels(Levels::default()));
                         add(ui, "Invert", MaskEffectKind::Invert);
+                        add(ui, "Blur", MaskEffectKind::Blur { radius: 2 });
+                        add(ui, "Expand", MaskEffectKind::Dilate { radius: 2 });
+                        add(ui, "Erode", MaskEffectKind::Erode { radius: 2 });
+                        add(ui, "Contrast", MaskEffectKind::Contrast { amount: 1.0, pivot: 0.5 });
                         if ui.add(egui::Button::new(RichText::new(format!("{}  Image", icons::PLUS)).font(theme::font(12.0))))
                             .on_hover_text("A black & white image or a logo with transparency")
                             .clicked()
@@ -339,18 +367,27 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
             },
         );
         cmds.extend(head_cmds);
-    }));
+    })));
     if picking != state.picking_parts {
         state.picking_parts = picking;
         if picking {
-            state.set_status("Click parts in the 3D view to show or hide this layer there. Esc when done.", now);
+            state.set_status(
+                "Click parts in the 3D view to show or hide this layer there. Esc when done.",
+                now,
+            );
         }
     }
     state.run(cmds, now);
     if let Some((channel, path)) = texture_drop {
         match state.session.set_fill_channel_image(id, channel, &path) {
             Ok(()) => state.set_status(
-                format!("{} now uses {}", channel.display_name(), path.file_name().and_then(|n| n.to_str()).unwrap_or("the texture")),
+                format!(
+                    "{} now uses {}",
+                    channel.display_name(),
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("the texture")
+                ),
                 now,
             ),
             Err(e) => state.set_status(format!("Texture: {e}"), now),
@@ -358,7 +395,13 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
     }
 }
 
-fn effect_editor(ui: &mut Ui, state: &mut UiState, layer: subcraft_core::LayerId, e: &Arc<MaskEffect>, cmds: &mut Vec<Command>) {
+fn effect_editor(
+    ui: &mut Ui,
+    state: &mut UiState,
+    layer: subcraft_core::LayerId,
+    e: &Arc<MaskEffect>,
+    cmds: &mut Vec<Command>,
+) {
     let mut eff = (**e).clone();
     let mut changed = false;
     egui::Frame::new().fill(BG_2).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
@@ -393,6 +436,14 @@ fn effect_editor(ui: &mut Ui, state: &mut UiState, layer: subcraft_core::LayerId
                     changed |= slider_row(ui, "In high", egui::Slider::new(&mut l.in_high, 0.0..=1.0)).changed();
                     changed |= slider_row(ui, "Gamma", egui::Slider::new(&mut l.gamma, 0.1..=4.0)).changed();
                 }
+                MaskEffectKind::Blur { radius } | MaskEffectKind::Dilate { radius } | MaskEffectKind::Erode { radius } => {
+                    changed |= slider_row(ui, "Radius", egui::Slider::new(radius, 0..=32).suffix(" px")).changed();
+                    hint(ui, "Non-destructive filter; neighboring texture tiles are included.");
+                }
+                MaskEffectKind::Contrast { amount, pivot } => {
+                    changed |= slider_row(ui, "Contrast", egui::Slider::new(amount, 0.0..=4.0)).changed();
+                    changed |= slider_row(ui, "Pivot", egui::Slider::new(pivot, 0.0..=1.0)).changed();
+                }
                 MaskEffectKind::Image { resource, projection, invert } => {
                     if image_row(ui, state, *resource) {
                         crate::files::pick(ui.ctx(), crate::files::Purpose::MaskImage { layer, effect: e.id }, crate::files::IMAGES, false, None);
@@ -414,7 +465,13 @@ fn effect_editor(ui: &mut Ui, state: &mut UiState, layer: subcraft_core::LayerId
 /// Thumbnail, name and size of an image resource, with a Replace button. True if clicked.
 fn image_row(ui: &mut Ui, state: &mut UiState, resource: subcraft_core::ResourceId) -> bool {
     let Some(r) = state.session.resources().get(resource).cloned() else {
-        ui.label(RichText::new(format!("{}  Image missing from the project", icons::WARNING)).color(theme::WARNING));
+        ui.label(
+            RichText::new(format!(
+                "{}  Image missing from the project",
+                icons::WARNING
+            ))
+            .color(theme::WARNING),
+        );
         return secondary_button(ui, "Choose image…").clicked();
     };
     let tex = state
@@ -423,7 +480,11 @@ fn image_row(ui: &mut Ui, state: &mut UiState, resource: subcraft_core::Resource
         .or_insert_with(|| {
             let (w, h, rgba) = r.bitmap.preview_rgba8(96);
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-            ui.ctx().load_texture(format!("image-{}", resource.0), img, egui::TextureOptions::LINEAR)
+            ui.ctx().load_texture(
+                format!("image-{}", resource.0),
+                img,
+                egui::TextureOptions::LINEAR,
+            )
         })
         .clone();
     let mut clicked = false;
@@ -433,7 +494,11 @@ fn image_row(ui: &mut Ui, state: &mut UiState, resource: subcraft_core::Resource
         ui.image((tex.id(), size * scale));
         ui.vertical(|ui| {
             ui.label(RichText::new(&r.name).color(theme::TEXT));
-            ui.label(RichText::new(format!("{} × {}", r.bitmap.width, r.bitmap.height)).color(TEXT_DIM).font(theme::font(11.0)));
+            ui.label(
+                RichText::new(format!("{} × {}", r.bitmap.width, r.bitmap.height))
+                    .color(TEXT_DIM)
+                    .font(theme::font(11.0)),
+            );
             clicked = secondary_button(ui, "Replace…").clicked();
         });
     });
@@ -444,18 +509,35 @@ fn image_row(ui: &mut Ui, state: &mut UiState, resource: subcraft_core::Resource
 fn projection_editor(ui: &mut Ui, proj: &mut Projection) -> bool {
     let mut changed = false;
     prop_row(ui, "Mode", |ui| {
-        changed |= segmented(ui, &mut proj.mode, &[(ProjectionMode::Uv, "UV"), (ProjectionMode::Triplanar, "Tri-planar"), (ProjectionMode::Planar, "Planar")]);
+        changed |= segmented(
+            ui,
+            &mut proj.mode,
+            &[
+                (ProjectionMode::Uv, "UV"),
+                (ProjectionMode::Triplanar, "Tri-planar"),
+                (ProjectionMode::Planar, "Planar"),
+            ],
+        );
     });
     // Tiling: X and Y linked by default (lock), separate when unlocked. The lock is UI state,
     // remembered per editor; it starts unlocked if the two values already differ.
     let lock_id = ui.id().with("tiling_lock");
-    let mut locked = ui.data(|d| d.get_temp::<bool>(lock_id)).unwrap_or(proj.scale[0] == proj.scale[1]);
+    let mut locked = ui
+        .data(|d| d.get_temp::<bool>(lock_id))
+        .unwrap_or(proj.scale[0] == proj.scale[1]);
     prop_row(ui, "Tiling", |ui| {
         fn tiling(v: &mut f32) -> egui::DragValue<'_> {
-            egui::DragValue::new(v).speed(0.05).range(0.01..=256.0).max_decimals(2)
+            egui::DragValue::new(v)
+                .speed(0.05)
+                .range(0.01..=256.0)
+                .max_decimals(2)
         }
         if locked {
-            if ui.add(tiling(&mut proj.scale[0])).on_hover_text("Repeats across the surface (X and Y together)").changed() {
+            if ui
+                .add(tiling(&mut proj.scale[0]))
+                .on_hover_text("Repeats across the surface (X and Y together)")
+                .changed()
+            {
                 proj.scale[1] = proj.scale[0];
                 changed = true;
             }
@@ -465,7 +547,11 @@ fn projection_editor(ui: &mut Ui, proj: &mut Projection) -> bool {
             ui.label(RichText::new("Y").color(TEXT_DIM));
             changed |= ui.add(tiling(&mut proj.scale[1])).changed();
         }
-        if ui.checkbox(&mut locked, "Link").on_hover_text("Same tiling for X and Y; untick to set them separately").changed() {
+        if ui
+            .checkbox(&mut locked, "Link")
+            .on_hover_text("Same tiling for X and Y; untick to set them separately")
+            .changed()
+        {
             if locked && proj.scale[1] != proj.scale[0] {
                 proj.scale[1] = proj.scale[0];
                 changed = true;
@@ -475,24 +561,45 @@ fn projection_editor(ui: &mut Ui, proj: &mut Projection) -> bool {
     ui.data_mut(|d| d.insert_temp(lock_id, locked));
     prop_row(ui, "Offset", |ui| {
         fn offset(v: &mut f32) -> egui::DragValue<'_> {
-            egui::DragValue::new(v).speed(0.005).range(-16.0..=16.0).max_decimals(3)
+            egui::DragValue::new(v)
+                .speed(0.005)
+                .range(-16.0..=16.0)
+                .max_decimals(3)
         }
         ui.label(RichText::new("X").color(TEXT_DIM));
         changed |= ui.add(offset(&mut proj.offset[0])).changed();
         ui.label(RichText::new("Y").color(TEXT_DIM));
         changed |= ui.add(offset(&mut proj.offset[1])).changed();
     });
-    changed |= slider_row(ui, "Rotation", egui::Slider::new(&mut proj.rotation_deg, -180.0..=180.0).suffix("°")).changed();
+    changed |= slider_row(
+        ui,
+        "Rotation",
+        egui::Slider::new(&mut proj.rotation_deg, -180.0..=180.0).suffix("°"),
+    )
+    .changed();
     if proj.mode == ProjectionMode::Triplanar {
-        changed |= slider_row(ui, "Sharpness", egui::Slider::new(&mut proj.triplanar_sharpness, 1.0..=32.0)).changed();
+        changed |= slider_row(
+            ui,
+            "Sharpness",
+            egui::Slider::new(&mut proj.triplanar_sharpness, 1.0..=32.0),
+        )
+        .changed();
     }
     if proj.mode == ProjectionMode::Planar {
         prop_row(ui, "Axis", |ui| {
             changed |= segmented(ui, &mut proj.planar_axis, &[(0u8, "X"), (1, "Y"), (2, "Z")]);
         });
     }
-    let default = Projection { mode: proj.mode, planar_axis: proj.planar_axis, ..Projection::default() };
-    if *proj != default && ui.small_button("Reset tiling, offset and rotation").clicked() {
+    let default = Projection {
+        mode: proj.mode,
+        planar_axis: proj.planar_axis,
+        ..Projection::default()
+    };
+    if *proj != default
+        && ui
+            .small_button("Reset tiling, offset and rotation")
+            .clicked()
+    {
         *proj = default;
         changed = true;
     }

@@ -79,6 +79,36 @@ pub struct HdriUpload<'a> {
 }
 
 /// Camera and lighting for one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ViewMode {
+    #[default]
+    Material = 0,
+    BaseColor = 1,
+    Roughness = 2,
+    Metallic = 3,
+    Normal = 4,
+    Height = 5,
+    AmbientOcclusion = 6,
+}
+
+impl ViewMode {
+    pub const ALL: [Self; 7] = [Self::Material, Self::BaseColor, Self::Roughness, Self::Metallic, Self::Normal, Self::Height, Self::AmbientOcclusion];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Material => "Material PBR",
+            Self::BaseColor => "Base Color",
+            Self::Roughness => "Roughness",
+            Self::Metallic => "Metallic",
+            Self::Normal => "Normal",
+            Self::Height => "Height",
+            Self::AmbientOcclusion => "Ambient Occlusion",
+        }
+    }
+}
+
+/// Camera and lighting for one frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewParams {
     pub view: Mat4,
@@ -93,6 +123,7 @@ pub struct ViewParams {
     pub exposure: f32,
     /// Height-to-bump strength (UV units of slope per height unit; 0 disables bumps).
     pub height_scale: f32,
+    pub view_mode: ViewMode,
     /// Linear background color.
     pub background: [f32; 3],
 }
@@ -110,6 +141,7 @@ impl ViewParams {
             environment: EnvironmentParams::default(),
             exposure: 1.0,
             height_scale: 0.02,
+            view_mode: ViewMode::Material,
             background: [0.018, 0.019, 0.022],
         }
     }
@@ -446,7 +478,7 @@ impl ViewportRenderer {
             irr_up: v4(e.irradiance_up),
             irr_down: v4(e.irradiance_down),
             lights: [e.panels, e.top, e.key_softbox, if e.use_hdri && self.env_levels > 1 { 1.0 } else { 0.0 }],
-            env_misc: [e.rotation, e.hdri_intensity, (self.env_levels - 1) as f32, 0.0],
+            env_misc: [e.rotation, e.hdri_intensity, (self.env_levels - 1) as f32, params.view_mode as u32 as f32],
             sh,
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));

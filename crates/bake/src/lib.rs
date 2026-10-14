@@ -25,12 +25,14 @@ use subcraft_image::TiledImage;
 use subcraft_image::dilate::dilate_infinite;
 use subcraft_mesh::{Bvh, Mesh, topology};
 
-use surface::{Texel, cosine_directions, hash01, texels};
+use surface::{Texel, cosine_directions, hash01, texels_cancellable};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BakeSettings {
     /// Output size (square).
     pub size: u32,
+    /// Samples per output-pixel axis: 1 = native, 2 = 4 samples, 4 = 16 samples.
+    pub supersampling: u32,
     pub maps: Vec<MeshMapKind>,
     pub ao_samples: u32,
     /// Occlusion ray length as a fraction of the mesh bounding-box diagonal.
@@ -48,6 +50,7 @@ impl Default for BakeSettings {
     fn default() -> Self {
         Self {
             size: 1024,
+            supersampling: 1,
             maps: MeshMapKind::ALL.to_vec(),
             ao_samples: 32,
             ao_distance: 0.25,
@@ -57,6 +60,57 @@ impl Default for BakeSettings {
             cage_front: 0.01,
             cage_rear: 0.01,
         }
+    }
+}
+
+impl BakeSettings {
+    /// Validate before allocating resolution-dependent buffers or launching ray work.
+    pub fn validate(&self) -> Result<(), BakeError> {
+        if self.size == 0 || self.size > 4096 {
+            return Err(BakeError::InvalidSettings(
+                "bake size must be between 1 and 4096",
+            ));
+        }
+        if ![1, 2, 4].contains(&self.supersampling) {
+            return Err(BakeError::InvalidSettings(
+                "supersampling must be 1, 2 or 4 samples per axis",
+            ));
+        }
+        if self.size * self.supersampling > 4096 {
+            return Err(BakeError::InvalidSettings(
+                "size × supersampling must not exceed 4096; lower the size or anti-aliasing quality",
+            ));
+        }
+        if self.maps.is_empty() {
+            return Err(BakeError::InvalidSettings("select at least one mesh map"));
+        }
+        if self.ao_samples == 0
+            || self.ao_samples > 1024
+            || self.thickness_samples == 0
+            || self.thickness_samples > 1024
+        {
+            return Err(BakeError::InvalidSettings(
+                "ray sample counts must be between 1 and 1024",
+            ));
+        }
+        for value in [
+            self.ao_distance,
+            self.curvature_radius,
+            self.cage_front,
+            self.cage_rear,
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(BakeError::InvalidSettings(
+                    "ray distances, curvature radius and cage distances must be finite and non-negative",
+                ));
+            }
+        }
+        if !self.thickness_distance.is_finite() || self.thickness_distance <= 0.0 {
+            return Err(BakeError::InvalidSettings(
+                "thickness distance must be finite and greater than zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -87,7 +141,11 @@ impl Progress {
     }
     pub fn fraction(&self) -> f32 {
         let t = self.total.load(Ordering::Relaxed);
-        if t == 0 { 0.0 } else { self.done.load(Ordering::Relaxed) as f32 / t as f32 }
+        if t == 0 {
+            0.0
+        } else {
+            (self.done.load(Ordering::Relaxed) as f32 / t as f32).min(1.0)
+        }
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -95,12 +153,18 @@ impl Progress {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+    /// Start another texture set with the same cancellation token.
+    pub fn reset_fraction(&self) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BakeError {
     Cancelled,
     NoTexels,
+    InvalidSettings(&'static str),
 }
 
 impl std::fmt::Display for BakeError {
@@ -108,6 +172,7 @@ impl std::fmt::Display for BakeError {
         match self {
             BakeError::Cancelled => f.write_str("bake cancelled"),
             BakeError::NoTexels => f.write_str("texture set has no UV-covered texels"),
+            BakeError::InvalidSettings(reason) => write!(f, "invalid bake settings: {reason}"),
         }
     }
 }
@@ -123,20 +188,40 @@ struct Detail {
     tri: u32,
     /// Offset direction for ray origins (geometric normal).
     offset: Vec3,
+    /// Projection misses use the low-poly geometry, including its own triangle indices.
+    high_poly: bool,
 }
 
 const CHUNK: usize = 2048;
 
 /// Bake the requested maps for one texture set.
-pub fn bake(input: &BakeInput, settings: &BakeSettings, progress: &Progress) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError> {
+pub fn bake(
+    input: &BakeInput,
+    settings: &BakeSettings,
+    progress: &Progress,
+) -> Result<BTreeMap<MeshMapKind, TiledImage>, BakeError> {
+    if progress.is_cancelled() {
+        return Err(BakeError::Cancelled);
+    }
+    settings.validate()?;
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(0, Ordering::Relaxed);
     let size = settings.size;
+    let sample_size = size * settings.supersampling;
     let low = input.low.mesh;
-    let samples = texels(low, input.material_slot, size);
+    let samples = texels_cancellable(low, input.material_slot, sample_size, || {
+        progress.is_cancelled()
+    })
+    .ok_or(BakeError::Cancelled)?;
     if samples.is_empty() {
         return Err(BakeError::NoTexels);
     }
     let detail_geo = input.high.unwrap_or(input.low);
-    let diag = low.bounds.diagonal().max(detail_geo.mesh.bounds.diagonal()).max(1e-6);
+    let diag = low
+        .bounds
+        .diagonal()
+        .max(detail_geo.mesh.bounds.diagonal())
+        .max(1e-6);
     let bias = diag * 2e-4;
 
     // Project onto the detail surface.
@@ -145,37 +230,77 @@ pub fn bake(input: &BakeInput, settings: &BakeSettings, progress: &Progress) -> 
             let front = settings.cage_front * diag;
             let rear = settings.cage_rear * diag;
             let n = t.normal.normalize_or(t.geometric_normal);
-            if let Some(hit) = high.bvh.intersect(t.position + n * front, -n, 0.0, front + rear) {
+            if let Some(hit) = high
+                .bvh
+                .intersect(t.position + n * front, -n, 0.0, front + rear)
+            {
                 let sp = high.mesh.interpolate(hit.tri as usize, hit.u, hit.v);
                 let ng = sp.geometric_normal;
-                let normal = if sp.normal.dot(n) < 0.0 { -sp.normal } else { sp.normal };
-                return Detail { position: sp.position, normal, tri: hit.tri, offset: if ng.dot(n) < 0.0 { -ng } else { ng } };
+                let normal = if sp.normal.dot(n) < 0.0 {
+                    -sp.normal
+                } else {
+                    sp.normal
+                };
+                return Detail {
+                    position: sp.position,
+                    normal,
+                    tri: hit.tri,
+                    offset: if ng.dot(n) < 0.0 { -ng } else { ng },
+                    high_poly: true,
+                };
             }
         }
-        Detail { position: t.position, normal: t.normal, tri: t.tri, offset: t.geometric_normal }
+        Detail {
+            position: t.position,
+            normal: t.normal,
+            tri: t.tri,
+            offset: t.geometric_normal,
+            high_poly: false,
+        }
     };
 
     let wanted = |k: MeshMapKind| settings.maps.contains(&k);
-    let work_items = settings.maps.len().max(1) * samples.len();
+    let mut maps = settings.maps.clone();
+    maps.sort();
+    maps.dedup();
+    let work_items = (maps.len() + 1) * samples.len();
     progress.total.store(work_items, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
 
-    let details: Vec<Detail> = samples.par_iter().map(project).collect();
-    let elements = if wanted(MeshMapKind::Id) { Some(topology::mesh_elements(detail_geo.mesh)) } else { None };
+    let mut details = Vec::with_capacity(samples.len());
+    for chunk in samples.chunks(CHUNK) {
+        if progress.is_cancelled() {
+            return Err(BakeError::Cancelled);
+        }
+        details.par_extend(chunk.par_iter().map(project));
+        progress.done.fetch_add(chunk.len(), Ordering::Relaxed);
+    }
+    let low_elements = if wanted(MeshMapKind::Id) {
+        Some(topology::mesh_elements(low))
+    } else {
+        None
+    };
+    let high_elements = if wanted(MeshMapKind::Id) {
+        input.high.map(|high| topology::mesh_elements(high.mesh))
+    } else {
+        None
+    };
     let bounds = low.bounds;
     let extent = bounds.extent().max(Vec3::splat(1e-6));
 
     let mut out = BTreeMap::new();
-    for &kind in &settings.maps {
+    for &kind in &maps {
         let comps = kind.components();
         // Per-texel evaluation, chunked for cancellation and progress.
-        let eval = |i: usize| -> [f32; 3] {
+        let eval = |i: usize, dirs: &mut Vec<Vec3>| -> [f32; 3] {
             let t = &samples[i];
             let d = &details[i];
+            let geometry = if d.high_poly { detail_geo } else { input.low };
             match kind {
                 MeshMapKind::Normal => {
                     let n = t.normal.normalize_or(t.geometric_normal);
-                    let tan = (t.tangent.truncate() - n * n.dot(t.tangent.truncate())).normalize_or(n.any_orthonormal_vector());
+                    let tan = (t.tangent.truncate() - n * n.dot(t.tangent.truncate()))
+                        .normalize_or(n.any_orthonormal_vector());
                     let bit = n.cross(tan) * if t.tangent.w < 0.0 { -1.0 } else { 1.0 };
                     let h = d.normal;
                     let ts = Vec3::new(h.dot(tan), h.dot(bit), h.dot(n)).normalize_or(Vec3::Z);
@@ -190,64 +315,134 @@ pub fn bake(input: &BakeInput, settings: &BakeSettings, progress: &Progress) -> 
                     [p.x, p.y, p.z]
                 }
                 MeshMapKind::Id => {
-                    let e = elements.as_ref().map_or(0, |e| e[d.tri as usize]);
+                    let elements = if d.high_poly {
+                        high_elements.as_ref()
+                    } else {
+                        low_elements.as_ref()
+                    };
+                    let e = elements.map_or(0, |e| e[d.tri as usize]);
                     let hue = (e as f32 * 0.618_034).fract();
                     hsv_to_rgb([hue, 0.65, 0.9])
                 }
                 MeshMapKind::AmbientOcclusion => {
-                    let mut dirs = Vec::with_capacity(settings.ao_samples as usize);
-                    cosine_directions(d.normal, settings.ao_samples.max(1), hash01(t.index, 1), &mut dirs);
+                    cosine_directions(d.normal, settings.ao_samples, hash01(t.index, 1), dirs);
                     let origin = d.position + d.offset * bias;
                     let dist = settings.ao_distance * diag;
                     let (mut occluded, mut counted) = (0u32, 0u32);
-                    for dir in &dirs {
+                    for dir in dirs.iter() {
                         if dir.dot(d.offset) <= 0.0 {
                             continue;
                         }
                         counted += 1;
-                        if detail_geo.bvh.occluded(origin, *dir, 0.0, dist) {
+                        if geometry.bvh.occluded(origin, *dir, 0.0, dist) {
                             occluded += 1;
                         }
                     }
-                    let ao = if counted == 0 { 1.0 } else { 1.0 - occluded as f32 / counted as f32 };
+                    let ao = if counted == 0 {
+                        1.0
+                    } else {
+                        1.0 - occluded as f32 / counted as f32
+                    };
                     [ao; 3]
                 }
                 MeshMapKind::Thickness => {
-                    let mut dirs = Vec::with_capacity(settings.thickness_samples as usize);
-                    cosine_directions(-d.normal, settings.thickness_samples.max(1), hash01(t.index, 2), &mut dirs);
+                    cosine_directions(
+                        -d.normal,
+                        settings.thickness_samples,
+                        hash01(t.index, 2),
+                        dirs,
+                    );
                     let origin = d.position - d.offset * bias;
                     let max = settings.thickness_distance * diag;
-                    let total: f32 = dirs.iter().map(|dir| detail_geo.bvh.intersect(origin, *dir, 0.0, max).map_or(max, |h| h.t)).sum();
+                    let total: f32 = dirs
+                        .iter()
+                        .map(|dir| {
+                            geometry
+                                .bvh
+                                .intersect(origin, *dir, 0.0, max)
+                                .map_or(max, |h| h.t)
+                        })
+                        .sum();
                     let avg = total / dirs.len() as f32 / max;
                     [1.0 - avg; 3]
                 }
                 MeshMapKind::Curvature => {
-                    [curvature::curvature_at(detail_geo.mesh, detail_geo.bvh, d.position, d.normal, settings.curvature_radius * diag); 3]
+                    [curvature::curvature_at(
+                        geometry.mesh,
+                        geometry.bvh,
+                        d.position,
+                        d.normal,
+                        settings.curvature_radius * diag,
+                    ); 3]
                 }
             }
         };
-        let mut values: Vec<[f32; 3]> = Vec::with_capacity(samples.len());
+        let n = (size * size) as usize;
+        let neutral = kind.neutral_value();
+        let mut dense = vec![0.0; n * comps];
+        for pixel in dense.chunks_exact_mut(comps) {
+            pixel.copy_from_slice(&neutral[..comps]);
+        }
+        let mut covered = vec![false; n];
+        let mut counts = vec![0u16; n];
+        // Only one result chunk is retained. At 4096² this avoids a second ~192 MiB
+        // full-resolution array, including when supersampling a smaller output.
+        let mut values: Vec<[f32; 3]> = Vec::with_capacity(CHUNK);
         for start in (0..samples.len()).step_by(CHUNK) {
             if progress.is_cancelled() {
                 return Err(BakeError::Cancelled);
             }
             let end = (start + CHUNK).min(samples.len());
-            values.par_extend((start..end).into_par_iter().map(eval));
+            values.clear();
+            values.par_extend(
+                (start..end)
+                    .into_par_iter()
+                    .map_init(Vec::new, |dirs, i| eval(i, dirs)),
+            );
+            for (t, v) in samples[start..end].iter().zip(&values) {
+                let x = t.index % sample_size / settings.supersampling;
+                let y = t.index / sample_size / settings.supersampling;
+                let i = (y * size + x) as usize;
+                if counts[i] == 0 {
+                    dense[i * comps..(i + 1) * comps].copy_from_slice(&v[..comps]);
+                } else if kind != MeshMapKind::Id {
+                    // ID maps stay categorical; averaging two IDs would create an invalid color.
+                    for c in 0..comps {
+                        dense[i * comps + c] += v[c];
+                    }
+                }
+                counts[i] += 1;
+                covered[i] = true;
+            }
             progress.done.fetch_add(end - start, Ordering::Relaxed);
         }
-        let n = (size * size) as usize;
-        let neutral = kind.neutral_value();
-        let mut dense: Vec<f32> = (0..n).flat_map(|_| neutral[..comps].to_vec()).collect();
-        let mut covered = vec![false; n];
-        for (t, v) in samples.iter().zip(&values) {
-            let i = t.index as usize;
-            dense[i * comps..(i + 1) * comps].copy_from_slice(&v[..comps]);
-            covered[i] = true;
+        if settings.supersampling > 1 && kind != MeshMapKind::Id {
+            for (pixel, &count) in dense.chunks_exact_mut(comps).zip(&counts) {
+                if count == 0 {
+                    continue;
+                }
+                for value in pixel.iter_mut() {
+                    *value /= count as f32;
+                }
+                if matches!(kind, MeshMapKind::Normal | MeshMapKind::WorldSpaceNormal) {
+                    let normal = (Vec3::new(pixel[0], pixel[1], pixel[2]) * 2.0 - Vec3::ONE)
+                        .normalize_or(Vec3::Z)
+                        * 0.5
+                        + Vec3::splat(0.5);
+                    pixel.copy_from_slice(&normal.to_array());
+                }
+            }
         }
         dilate_infinite(size as usize, size as usize, comps, &mut dense, &covered);
+        if progress.is_cancelled() {
+            return Err(BakeError::Cancelled);
+        }
         let mut fill = [0.0f32; 4];
         fill[..comps].copy_from_slice(&neutral[..comps]);
-        out.insert(kind, TiledImage::from_dense(size, size, comps, fill, &dense));
+        out.insert(
+            kind,
+            TiledImage::from_dense(size, size, comps, fill, &dense),
+        );
     }
     Ok(out)
 }

@@ -8,12 +8,15 @@ use std::sync::Arc;
 use glam::{Vec2, Vec3};
 use subcraft_compositor::{Composite, CompositeCache, EvalContext};
 use subcraft_core::{ChannelKind, LayerId, TextureSetId};
-use subcraft_doc::{Document, History, Layer, LayerContent, LayerLocation, Mask, MaskEffect, ResourceStore, TextureSet};
+use subcraft_doc::{
+    Document, History, Layer, LayerContent, LayerLocation, Mask, MaskEffect, ResourceStore,
+    TextureSet,
+};
 use subcraft_materials::{GeometryCache, MeshMaps};
 use subcraft_mesh::{Bvh, Mesh, import_mesh, primitives};
 use subcraft_paint::{
-    BrushMaterial, BrushSettings, Camera, DepthCache, PaintContext, PaintError, PaintTarget, PolygonFillMode, Stroke, StrokeMode,
-    StrokeOptions,
+    BrushMaterial, BrushSettings, Camera, DepthCache, PaintContext, PaintError, PaintTarget,
+    PolygonFillMode, Stroke, StrokeMode, StrokeOptions,
 };
 
 use crate::actions::Action;
@@ -33,7 +36,12 @@ pub struct Scene {
 impl Scene {
     pub fn new(mesh: Mesh) -> Self {
         let mesh = Arc::new(mesh);
-        Self { bvh: Bvh::build(&mesh), geometry: GeometryCache::new(mesh.clone()), depth: DepthCache::new(), mesh }
+        Self {
+            bvh: Bvh::build(&mesh),
+            geometry: GeometryCache::new(mesh.clone()),
+            depth: DepthCache::new(),
+            mesh,
+        }
     }
 }
 
@@ -103,6 +111,8 @@ pub struct Session {
     project_path: Option<PathBuf>,
     /// Document as of the last save / load / new (for the unsaved-changes indicator).
     saved_doc: Document,
+    /// Document equality may walk a large layer tree; query it at most once per revision.
+    modified_cache: std::cell::Cell<Option<(u64, bool)>>,
     /// Mesh maps changed (baked) since the last save.
     maps_dirty: bool,
 }
@@ -121,11 +131,22 @@ impl Session {
 
     /// Session over an existing document (project load).
     pub fn from_parts(mesh: Mesh, doc: Document, resources: ResourceStore, label: &str) -> Self {
-        assert!(!doc.texture_sets.is_empty(), "a document has at least one texture set");
+        assert!(
+            !doc.texture_sets.is_empty(),
+            "a document has at least one texture set"
+        );
         let first = &doc.texture_sets[0];
-        let selection = Selection { texture_set: first.id, layer: first.layers.last().map(|l| l.id) };
+        let selection = Selection {
+            texture_set: first.id,
+            layer: first.layers.last().map(|l| l.id),
+        };
         let material = BrushMaterial::new(first);
-        let layer_counter = doc.texture_sets.iter().map(|t| t.layer_count() as u32).max().unwrap_or(1);
+        let layer_counter = doc
+            .texture_sets
+            .iter()
+            .map(|t| t.layer_count() as u32)
+            .max()
+            .unwrap_or(1);
         Self {
             scene: Scene::new(mesh),
             resources,
@@ -133,6 +154,7 @@ impl Session {
             no_maps: MeshMaps::new(),
             history: History::new(doc.clone(), label),
             saved_doc: doc.clone(),
+            modified_cache: std::cell::Cell::new(None),
             doc,
             selection,
             brush: BrushState {
@@ -178,11 +200,17 @@ impl Session {
             Some(p) => p.to_path_buf(),
             None => return Err("no project path: use Save As".into()),
         };
-        let maps: subcraft_project::MeshMapSet = self.mesh_maps.iter().map(|(id, m)| (*id, m.as_map().clone())).collect();
-        subcraft_project::save_project(&path, &self.scene.mesh, &self.doc, &self.resources, &maps).map_err(|e| e.to_string())?;
+        let maps: subcraft_project::MeshMapSet = self
+            .mesh_maps
+            .iter()
+            .map(|(id, m)| (*id, m.as_map().clone()))
+            .collect();
+        subcraft_project::save_project(&path, &self.scene.mesh, &self.doc, &self.resources, &maps)
+            .map_err(|e| e.to_string())?;
         self.project_path = Some(path.clone());
         self.saved_doc = self.doc.clone();
         self.maps_dirty = false;
+        self.modified_cache.set(Some((self.revision, false)));
         Ok(path)
     }
 
@@ -192,7 +220,17 @@ impl Session {
 
     /// True if the document differs from the last save / load.
     pub fn is_modified(&self) -> bool {
-        self.maps_dirty || self.doc != self.saved_doc
+        if self.maps_dirty {
+            return true;
+        }
+        if let Some((revision, modified)) = self.modified_cache.get()
+            && revision == self.revision
+        {
+            return modified;
+        }
+        let modified = self.doc != self.saved_doc;
+        self.modified_cache.set(Some((self.revision, modified)));
+        modified
     }
 
     // ----- baking --------------------------------------------------------------------------------
@@ -203,7 +241,11 @@ impl Session {
     }
 
     /// Install baked maps (merged over existing ones) and refresh that set's composite.
-    pub fn set_mesh_maps(&mut self, ts: TextureSetId, maps: std::collections::BTreeMap<subcraft_core::MeshMapKind, subcraft_image::TiledImage>) {
+    pub fn set_mesh_maps(
+        &mut self,
+        ts: TextureSetId,
+        maps: std::collections::BTreeMap<subcraft_core::MeshMapKind, subcraft_image::TiledImage>,
+    ) {
         let entry = self.mesh_maps.entry(ts).or_default();
         let mut merged = entry.as_map().clone();
         merged.extend(maps);
@@ -217,7 +259,11 @@ impl Session {
 
     /// Start baking on a background thread; poll the job each frame.
     pub fn start_bake(&self, request: crate::bake_job::BakeRequest) -> crate::bake_job::BakeJob {
-        crate::bake_job::BakeJob::start(self.scene.mesh.clone(), Arc::new(self.scene.bvh.clone()), request)
+        crate::bake_job::BakeJob::start(
+            self.scene.mesh.clone(),
+            Arc::new(self.scene.bvh.clone()),
+            request,
+        )
     }
 
     /// The built-in two-material sample crate.
@@ -263,11 +309,15 @@ impl Session {
     }
 
     pub fn selected_texture_set(&self) -> &TextureSet {
-        self.doc.texture_set(self.selection.texture_set).unwrap_or(&self.doc.texture_sets[0])
+        self.doc
+            .texture_set(self.selection.texture_set)
+            .unwrap_or(&self.doc.texture_sets[0])
     }
 
     pub fn selected_layer(&self) -> Option<&Layer> {
-        self.selection.layer.and_then(|id| self.selected_texture_set().find(id))
+        self.selection
+            .layer
+            .and_then(|id| self.selected_texture_set().find(id))
     }
 
     pub fn composite(&self, ts: TextureSetId) -> Option<&Composite> {
@@ -275,7 +325,11 @@ impl Session {
     }
 
     fn texture_set_of(&self, layer: LayerId) -> Option<TextureSetId> {
-        self.doc.texture_sets.iter().find(|t| t.find(layer).is_some()).map(|t| t.id)
+        self.doc
+            .texture_sets
+            .iter()
+            .find(|t| t.find(layer).is_some())
+            .map(|t| t.id)
     }
 
     /// Surface point under a screen position.
@@ -294,7 +348,9 @@ impl Session {
 
     /// World radius of the current brush.
     pub fn brush_radius(&self) -> f32 {
-        self.brush.settings.radius(self.scene.mesh.bounds.diagonal())
+        self.brush
+            .settings
+            .radius(self.scene.mesh.bounds.diagonal())
     }
 
     // ----- commands ------------------------------------------------------------------------------
@@ -312,10 +368,23 @@ impl Session {
         merge_key: Option<String>,
         f: impl FnOnce(&mut TextureSet) -> Result<R, CommandError>,
     ) -> Result<R, CommandError> {
-        let ts_id = self.texture_set_of(layer).ok_or(CommandError::LayerNotFound)?;
-        let ts = self.doc.texture_set_mut(ts_id).ok_or(CommandError::TextureSetNotFound)?;
-        let r = f(ts)?;
-        self.commit(label, merge_key);
+        let ts_id = self
+            .texture_set_of(layer)
+            .ok_or(CommandError::LayerNotFound)?;
+        // Work on a COW snapshot: a rejected command must never leave a partial edit behind.
+        let mut ts = self
+            .doc
+            .texture_set(ts_id)
+            .ok_or(CommandError::TextureSetNotFound)?
+            .clone();
+        let r = f(&mut ts)?;
+        if self.doc.texture_set(ts_id) != Some(&ts) {
+            *self
+                .doc
+                .texture_set_mut(ts_id)
+                .ok_or(CommandError::TextureSetNotFound)? = ts;
+            self.commit(label, merge_key);
+        }
         Ok(r)
     }
 
@@ -340,6 +409,7 @@ impl Session {
         if self.stroke.is_some() && !matches!(cmd, Command::Seal) {
             return Err(CommandError::StrokeInProgress);
         }
+        self.check_command_editable(&cmd)?;
         match cmd {
             Command::Undo => {
                 if self.history.undo().is_some() {
@@ -358,13 +428,20 @@ impl Session {
             }
             Command::Seal => self.history.seal(),
             Command::SelectTextureSet(id) => {
-                let ts = self.doc.texture_set(id).ok_or(CommandError::TextureSetNotFound)?;
-                self.selection = Selection { texture_set: id, layer: ts.layers.last().map(|l| l.id) };
+                let ts = self
+                    .doc
+                    .texture_set(id)
+                    .ok_or(CommandError::TextureSetNotFound)?;
+                self.selection = Selection {
+                    texture_set: id,
+                    layer: ts.layers.last().map(|l| l.id),
+                };
                 self.revision += 1;
             }
             Command::SelectLayer(layer) => {
                 if let Some(l) = layer {
-                    self.selection.texture_set = self.texture_set_of(l).ok_or(CommandError::LayerNotFound)?;
+                    self.selection.texture_set =
+                        self.texture_set_of(l).ok_or(CommandError::LayerNotFound)?;
                 }
                 self.selection.layer = layer;
                 self.revision += 1;
@@ -373,12 +450,24 @@ impl Session {
                 self.layer_counter += 1;
                 let ts_id = self.selection.texture_set;
                 let reference = self.selection.layer;
-                let ts = self.doc.texture_set_mut(ts_id).ok_or(CommandError::TextureSetNotFound)?;
+                let ts = self
+                    .doc
+                    .texture_set_mut(ts_id)
+                    .ok_or(CommandError::TextureSetNotFound)?;
                 let tc = ts.clone();
                 let (layer, label) = match kind {
-                    NewLayer::Paint => (Layer::new_paint(format!("Layer {}", self.layer_counter), &tc), "New Paint Layer"),
-                    NewLayer::Fill => (Layer::new_fill(format!("Fill {}", self.layer_counter), &tc), "New Fill Layer"),
-                    NewLayer::Folder => (Layer::new_folder(format!("Folder {}", self.layer_counter), &tc), "New Folder"),
+                    NewLayer::Paint => (
+                        Layer::new_paint(format!("Layer {}", self.layer_counter), &tc),
+                        "New Paint Layer",
+                    ),
+                    NewLayer::Fill => (
+                        Layer::new_fill(format!("Fill {}", self.layer_counter), &tc),
+                        "New Fill Layer",
+                    ),
+                    NewLayer::Folder => (
+                        Layer::new_folder(format!("Folder {}", self.layer_counter), &tc),
+                        "New Folder",
+                    ),
                 };
                 let id = ts.insert_above(reference, layer);
                 self.selection.layer = Some(id);
@@ -387,7 +476,10 @@ impl Session {
             Command::InsertLayer { layer, label } => {
                 let ts_id = self.selection.texture_set;
                 let reference = self.selection.layer;
-                let ts = self.doc.texture_set_mut(ts_id).ok_or(CommandError::TextureSetNotFound)?;
+                let ts = self
+                    .doc
+                    .texture_set_mut(ts_id)
+                    .ok_or(CommandError::TextureSetNotFound)?;
                 let mut layer = *layer;
                 if ts.find(layer.id).is_some() {
                     layer = layer.duplicate_with_new_ids();
@@ -396,12 +488,17 @@ impl Session {
                 self.selection.layer = Some(id);
                 self.commit(&label, None);
             }
-            Command::ApplyMaskEffects { layer, effects, label } => {
+            Command::ApplyMaskEffects {
+                layer,
+                effects,
+                label,
+            } => {
                 self.edit_layer_set(layer, &label, None, |ts| {
                     let res = ts.resolution;
                     let l = Self::layer_mut(ts, layer)?;
                     let mask = l.mask.get_or_insert_with(|| Mask::new(res, false));
-                    mask.effects.extend(effects.into_iter().map(|k| Arc::new(MaskEffect::new(k))));
+                    mask.effects
+                        .extend(effects.into_iter().map(|k| Arc::new(MaskEffect::new(k))));
                     Ok(())
                 })?;
             }
@@ -411,20 +508,44 @@ impl Session {
                     ts.remove(id).map_err(|_| CommandError::LayerNotFound)?;
                     Ok(loc)
                 })?;
-                if self.selection.layer == Some(id) {
+                if self
+                    .selection
+                    .layer
+                    .is_some_and(|selected| self.selected_texture_set().find(selected).is_none())
+                {
                     self.selection.layer = self.neighbour_after_removal(loc);
                 }
             }
             Command::DuplicateLayer(id) => {
-                let copy = self.edit_layer_set(id, "Duplicate Layer", None, |ts| ts.duplicate(id).map_err(|_| CommandError::LayerNotFound))?;
+                let copy = self.edit_layer_set(id, "Duplicate Layer", None, |ts| {
+                    ts.duplicate(id).map_err(|_| CommandError::LayerNotFound)
+                })?;
                 self.selection.layer = Some(copy);
             }
             Command::GroupLayer(id) => {
-                self.edit_layer_set(id, "Group Layer", None, |ts| ts.group(id, "Folder").map_err(|_| CommandError::LayerNotFound))?;
+                let folder = self.edit_layer_set(id, "Group Layer", None, |ts| {
+                    ts.group(id, "Folder")
+                        .map_err(|_| CommandError::LayerNotFound)
+                })?;
+                self.selection.layer = Some(folder);
             }
-            Command::MoveLayer { layer, parent, index } => {
+            Command::MoveLayer {
+                layer,
+                parent,
+                index,
+            } => {
                 self.edit_layer_set(layer, "Move Layer", None, |ts| {
-                    ts.move_to(layer, parent, index).map_err(|e| CommandError::Invalid(format!("{e:?}")))
+                    ts.move_to(layer, parent, index)
+                        .map_err(|e| CommandError::Invalid(format!("{e:?}")))?;
+                    if let Some(parent) = parent
+                        && let Some(Layer {
+                            content: LayerContent::Group(folder),
+                            ..
+                        }) = ts.find_mut(parent)
+                    {
+                        folder.expanded = true;
+                    }
+                    Ok(())
                 })?;
             }
             Command::MoveUp(id) | Command::MoveDown(id) => {
@@ -435,44 +556,112 @@ impl Session {
                         None => ts.layers.len(),
                         Some(p) => ts.find(p).map_or(0, |p| p.children().len()),
                     };
-                    let target = if up { loc.index + 1 } else { loc.index.checked_sub(1).ok_or(CommandError::Invalid("already at bottom".into()))? };
+                    let target = if up {
+                        loc.index + 1
+                    } else {
+                        loc.index
+                            .checked_sub(1)
+                            .ok_or(CommandError::Invalid("already at bottom".into()))?
+                    };
                     if target >= siblings {
                         return Err(CommandError::Invalid("already at top".into()));
                     }
-                    ts.move_to(id, loc.parent, target).map_err(|e| CommandError::Invalid(format!("{e:?}")))
+                    ts.move_to(id, loc.parent, target)
+                        .map_err(|e| CommandError::Invalid(format!("{e:?}")))
                 })?;
             }
             Command::SetVisible { layer, visible } => {
-                self.edit_layer_set(layer, if visible { "Show Layer" } else { "Hide Layer" }, None, |ts| {
-                    Self::layer_mut(ts, layer)?.visible = visible;
-                    Ok(())
-                })?;
+                self.edit_layer_set(
+                    layer,
+                    if visible { "Show Layer" } else { "Hide Layer" },
+                    None,
+                    |ts| {
+                        Self::layer_mut(ts, layer)?.visible = visible;
+                        Ok(())
+                    },
+                )?;
+            }
+            Command::SetLocked { layer, locked } => {
+                self.edit_layer_set(
+                    layer,
+                    if locked { "Lock Layer" } else { "Unlock Layer" },
+                    None,
+                    |ts| {
+                        Self::layer_mut(ts, layer)?.locked = locked;
+                        Ok(())
+                    },
+                )?;
+            }
+            Command::SetFolderExpanded { layer, expanded } => {
+                self.edit_layer_set(
+                    layer,
+                    if expanded {
+                        "Expand Folder"
+                    } else {
+                        "Collapse Folder"
+                    },
+                    None,
+                    |ts| {
+                        let LayerContent::Group(folder) = &mut Self::layer_mut(ts, layer)?.content
+                        else {
+                            return Err(CommandError::Invalid(
+                                "only folders can be expanded".into(),
+                            ));
+                        };
+                        folder.expanded = expanded;
+                        Ok(())
+                    },
+                )?;
             }
             Command::Rename { layer, name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err(CommandError::Invalid("layer name cannot be empty".into()));
+                }
                 self.edit_layer_set(layer, "Rename Layer", None, |ts| {
                     Self::layer_mut(ts, layer)?.name = name;
                     Ok(())
                 })?;
             }
-            Command::SetBlendMode { layer, channel, mode } => {
+            Command::SetBlendMode {
+                layer,
+                channel,
+                mode,
+            } => {
                 self.edit_layer_set(layer, "Blend Mode", None, |ts| {
-                    Self::layer_mut(ts, layer)?.blend.entry(channel).or_insert(subcraft_doc::ChannelBlend::new(mode)).mode = mode;
+                    Self::layer_mut(ts, layer)?
+                        .blend
+                        .entry(channel)
+                        .or_insert(subcraft_doc::ChannelBlend::new(mode))
+                        .mode = mode;
                     Ok(())
                 })?;
             }
-            Command::SetBlendOpacity { layer, channel, opacity } => {
+            Command::SetBlendOpacity {
+                layer,
+                channel,
+                opacity,
+            } => {
                 let key = format!("opacity:{layer}:{channel:?}");
                 self.edit_layer_set(layer, "Opacity", Some(key), |ts| {
                     let l = Self::layer_mut(ts, layer)?;
-                    let b = l.blend.get_mut(&channel).ok_or(CommandError::Invalid("channel not blended by this layer".into()))?;
+                    let b = l.blend.get_mut(&channel).ok_or(CommandError::Invalid(
+                        "channel not blended by this layer".into(),
+                    ))?;
                     b.opacity = opacity.clamp(0.0, 1.0);
                     Ok(())
                 })?;
             }
-            Command::SetFillChannel { layer, channel, fill } => {
+            Command::SetFillChannel {
+                layer,
+                channel,
+                fill,
+            } => {
                 let key = format!("fill:{layer}:{channel:?}");
                 self.edit_layer_set(layer, "Fill", Some(key), |ts| {
-                    let LayerContent::Fill(f) = &mut Self::layer_mut(ts, layer)?.content else { return Err(CommandError::NotAFillLayer) };
+                    let LayerContent::Fill(f) = &mut Self::layer_mut(ts, layer)?.content else {
+                        return Err(CommandError::NotAFillLayer);
+                    };
                     f.channels.insert(channel, fill);
                     Ok(())
                 })?;
@@ -480,7 +669,9 @@ impl Session {
             Command::SetFillProjection { layer, projection } => {
                 let key = format!("projection:{layer}");
                 self.edit_layer_set(layer, "Projection", Some(key), |ts| {
-                    let LayerContent::Fill(f) = &mut Self::layer_mut(ts, layer)?.content else { return Err(CommandError::NotAFillLayer) };
+                    let LayerContent::Fill(f) = &mut Self::layer_mut(ts, layer)?.content else {
+                        return Err(CommandError::NotAFillLayer);
+                    };
                     f.projection = projection;
                     Ok(())
                 })?;
@@ -494,7 +685,11 @@ impl Session {
             }
             Command::RemoveMask(layer) => {
                 self.edit_layer_set(layer, "Remove Mask", None, |ts| {
-                    Self::layer_mut(ts, layer)?.mask.take().map(|_| ()).ok_or(CommandError::NoMask)
+                    Self::layer_mut(ts, layer)?
+                        .mask
+                        .take()
+                        .map(|_| ())
+                        .ok_or(CommandError::NoMask)
                 })?;
             }
             Command::SetParts { layer, parts } => {
@@ -505,36 +700,126 @@ impl Session {
             }
             Command::SetMaskEnabled { layer, enabled } => {
                 self.edit_layer_set(layer, "Mask Enabled", None, |ts| {
-                    Self::layer_mut(ts, layer)?.mask.as_mut().ok_or(CommandError::NoMask)?.enabled = enabled;
+                    Self::layer_mut(ts, layer)?
+                        .mask
+                        .as_mut()
+                        .ok_or(CommandError::NoMask)?
+                        .enabled = enabled;
                     Ok(())
                 })?;
             }
             Command::AddMaskEffect { layer, kind } => {
                 self.edit_layer_set(layer, "Add Mask Effect", None, |ts| {
-                    let mask = Self::layer_mut(ts, layer)?.mask.as_mut().ok_or(CommandError::NoMask)?;
+                    let mask = Self::layer_mut(ts, layer)?
+                        .mask
+                        .as_mut()
+                        .ok_or(CommandError::NoMask)?;
                     mask.effects.push(Arc::new(MaskEffect::new(kind)));
                     Ok(())
                 })?;
             }
             Command::RemoveMaskEffect { layer, effect } => {
                 self.edit_layer_set(layer, "Remove Mask Effect", None, |ts| {
-                    let mask = Self::layer_mut(ts, layer)?.mask.as_mut().ok_or(CommandError::NoMask)?;
+                    let mask = Self::layer_mut(ts, layer)?
+                        .mask
+                        .as_mut()
+                        .ok_or(CommandError::NoMask)?;
                     let before = mask.effects.len();
                     mask.effects.retain(|e| e.id != effect);
-                    if mask.effects.len() == before { Err(CommandError::Invalid("no such effect".into())) } else { Ok(()) }
+                    if mask.effects.len() == before {
+                        Err(CommandError::Invalid("no such effect".into()))
+                    } else {
+                        Ok(())
+                    }
                 })?;
             }
             Command::SetMaskEffect { layer, effect } => {
                 let key = format!("effect:{layer}:{}", effect.id);
                 self.edit_layer_set(layer, "Mask Effect", Some(key), |ts| {
-                    let mask = Self::layer_mut(ts, layer)?.mask.as_mut().ok_or(CommandError::NoMask)?;
-                    let slot = mask.effects.iter_mut().find(|e| e.id == effect.id).ok_or(CommandError::Invalid("no such effect".into()))?;
+                    let mask = Self::layer_mut(ts, layer)?
+                        .mask
+                        .as_mut()
+                        .ok_or(CommandError::NoMask)?;
+                    let slot = mask
+                        .effects
+                        .iter_mut()
+                        .find(|e| e.id == effect.id)
+                        .ok_or(CommandError::Invalid("no such effect".into()))?;
                     *slot = Arc::new(effect);
                     Ok(())
                 })?;
             }
         }
         Ok(())
+    }
+
+    fn check_command_editable(&self, cmd: &Command) -> Result<(), CommandError> {
+        let check = |layer: LayerId, ancestor_only: bool, subtree: bool| {
+            let ts = self
+                .doc
+                .texture_sets
+                .iter()
+                .find(|ts| ts.find(layer).is_some())
+                .ok_or(CommandError::LayerNotFound)?;
+            let locked = if ancestor_only {
+                ts.ancestor_locked_by(layer)
+            } else {
+                ts.locked_by(layer)
+            };
+            if locked.is_some() {
+                return Err(CommandError::LayerLocked);
+            }
+            if subtree {
+                fn has_locked(layer: &Layer) -> bool {
+                    layer.locked || layer.children().iter().any(|child| has_locked(child))
+                }
+                if ts.find(layer).is_some_and(has_locked) {
+                    return Err(CommandError::LayerLocked);
+                }
+            }
+            Ok(())
+        };
+        match cmd {
+            Command::SetLocked { layer, .. } => check(*layer, true, false),
+            Command::DeleteLayer(layer)
+            | Command::DuplicateLayer(layer)
+            | Command::GroupLayer(layer)
+            | Command::MoveUp(layer)
+            | Command::MoveDown(layer) => check(*layer, false, true),
+            Command::MoveLayer { layer, parent, .. } => {
+                check(*layer, false, true)?;
+                if let Some(parent) = parent {
+                    check(*parent, false, false)?;
+                }
+                Ok(())
+            }
+            Command::AddLayer(_) | Command::InsertLayer { .. } => {
+                if let Some(parent) = self
+                    .selection
+                    .layer
+                    .and_then(|id| self.selected_texture_set().location(id))
+                    .and_then(|loc| loc.parent)
+                {
+                    check(parent, false, false)?;
+                }
+                Ok(())
+            }
+            Command::ApplyMaskEffects { layer, .. }
+            | Command::SetVisible { layer, .. }
+            | Command::Rename { layer, .. }
+            | Command::SetBlendMode { layer, .. }
+            | Command::SetBlendOpacity { layer, .. }
+            | Command::SetFillChannel { layer, .. }
+            | Command::SetFillProjection { layer, .. }
+            | Command::AddMask { layer, .. }
+            | Command::RemoveMask(layer)
+            | Command::SetMaskEnabled { layer, .. }
+            | Command::AddMaskEffect { layer, .. }
+            | Command::RemoveMaskEffect { layer, .. }
+            | Command::SetMaskEffect { layer, .. }
+            | Command::SetParts { layer, .. } => check(*layer, false, false),
+            _ => Ok(()),
+        }
     }
 
     fn neighbour_after_removal(&self, loc: Option<LayerLocation>) -> Option<LayerId> {
@@ -544,7 +829,11 @@ impl Session {
             None => &ts.layers,
             Some(p) => ts.find(p).map_or(&[], |l| l.children()),
         };
-        siblings.get(loc.index.saturating_sub(1)).or(siblings.last()).map(|l| l.id).or(loc.parent)
+        siblings
+            .get(loc.index.saturating_sub(1))
+            .or(siblings.last())
+            .map(|l| l.id)
+            .or(loc.parent)
     }
 
     /// Toolkit-independent actions. Returns false for actions the front end must handle itself
@@ -569,10 +858,21 @@ impl Session {
             }
             Action::BrushTool => self.brush.mode = StrokeMode::Paint,
             Action::EraserTool => self.brush.mode = StrokeMode::Erase,
-            Action::BrushSmaller => self.brush.settings.size = (self.brush.settings.size / 1.15).max(0.1),
-            Action::BrushLarger => self.brush.settings.size = (self.brush.settings.size * 1.15).min(100.0),
-            Action::ToggleSymmetryX => self.brush.options.symmetry[0] = !self.brush.options.symmetry[0],
-            Action::ResetCamera | Action::Save | Action::SaveAs | Action::OpenProject | Action::Export | Action::Bake => return Ok(false),
+            Action::BrushSmaller => {
+                self.brush.settings.size = (self.brush.settings.size / 1.15).max(0.1)
+            }
+            Action::BrushLarger => {
+                self.brush.settings.size = (self.brush.settings.size * 1.15).min(100.0)
+            }
+            Action::ToggleSymmetryX => {
+                self.brush.options.symmetry[0] = !self.brush.options.symmetry[0]
+            }
+            Action::ResetCamera
+            | Action::Save
+            | Action::SaveAs
+            | Action::OpenProject
+            | Action::Export
+            | Action::Bake => return Ok(false),
         }
         Ok(true)
     }
@@ -587,24 +887,56 @@ impl Session {
         let layer = self.selection.layer.ok_or(PaintError::LayerNotFound)?;
         let ts = self.selected_texture_set();
         let b = &self.brush;
-        let stroke = Stroke::begin(ts, layer, b.target, b.mode, b.settings, b.options, &b.material)?
-            .with_alpha(b.alpha.clone())
-            .with_stencil(if b.stencil_bypass { None } else { b.stencil.clone() });
+        let stroke = Stroke::begin(
+            ts,
+            layer,
+            b.target,
+            b.mode,
+            b.settings,
+            b.options,
+            &b.material,
+        )?
+        .with_alpha(b.alpha.clone())
+        .with_stencil(if b.stencil_bypass {
+            None
+        } else {
+            b.stencil.clone()
+        });
         let label = match (b.mode, b.target) {
             (StrokeMode::Paint, PaintTarget::Content) => "Paint Stroke",
             (StrokeMode::Erase, PaintTarget::Content) => "Erase Stroke",
             (_, PaintTarget::MaskBase) => "Mask Stroke",
         };
-        self.stroke = Some(ActiveStroke { stroke, texture_set: ts.id, label });
+        self.stroke = Some(ActiveStroke {
+            stroke,
+            texture_set: ts.id,
+            label,
+        });
         Ok(())
     }
 
     /// Continue the stroke to a screen position (`line`: straight segment, no lazy mouse).
-    pub fn stroke_to(&mut self, camera: &Camera, screen: Vec2, line: bool) -> Result<Vec<usize>, PaintError> {
-        let Some(active) = self.stroke.take() else { return Ok(Vec::new()) };
-        let result = self.with_stroke_context(active.texture_set, camera, |stroke, ts, ctx| {
-            if line { stroke.line_to(ts, ctx, screen) } else { stroke.add_point(ts, ctx, screen) }
-        }, active);
+    pub fn stroke_to(
+        &mut self,
+        camera: &Camera,
+        screen: Vec2,
+        line: bool,
+    ) -> Result<Vec<usize>, PaintError> {
+        let Some(active) = self.stroke.take() else {
+            return Ok(Vec::new());
+        };
+        let result = self.with_stroke_context(
+            active.texture_set,
+            camera,
+            |stroke, ts, ctx| {
+                if line {
+                    stroke.line_to(ts, ctx, screen)
+                } else {
+                    stroke.add_point(ts, ctx, screen)
+                }
+            },
+            active,
+        );
         if result.as_ref().is_ok_and(|t| !t.is_empty()) {
             self.revision += 1;
         }
@@ -612,13 +944,23 @@ impl Session {
     }
 
     /// Polygon fill on the selected layer at a screen position (one history entry).
-    pub fn polygon_fill(&mut self, camera: &Camera, screen: Vec2, mode: PolygonFillMode) -> Result<Vec<usize>, PaintError> {
+    pub fn polygon_fill(
+        &mut self,
+        camera: &Camera,
+        screen: Vec2,
+        mode: PolygonFillMode,
+    ) -> Result<Vec<usize>, PaintError> {
         if self.stroke.is_some() {
             return Ok(Vec::new());
         }
         self.begin_stroke()?;
         let active = self.stroke.take().expect("just begun");
-        let tiles = self.with_stroke_context(active.texture_set, camera, |stroke, ts, ctx| stroke.polygon_fill(ts, ctx, screen, mode), active)?;
+        let tiles = self.with_stroke_context(
+            active.texture_set,
+            camera,
+            |stroke, ts, ctx| stroke.polygon_fill(ts, ctx, screen, mode),
+            active,
+        )?;
         if let Some(a) = self.stroke.as_mut() {
             a.label = "Polygon Fill";
         }
@@ -637,7 +979,13 @@ impl Session {
             return Err(PaintError::LayerNotFound);
         };
         let geo = self.scene.geometry.get(ts.material_slot, ts.resolution);
-        let ctx = PaintContext { mesh: &self.scene.mesh, bvh: &self.scene.bvh, geometry: &geo, camera, depth: &self.scene.depth };
+        let ctx = PaintContext {
+            mesh: &self.scene.mesh,
+            bvh: &self.scene.bvh,
+            geometry: &geo,
+            camera,
+            depth: &self.scene.depth,
+        };
         let result = f(&mut active.stroke, &mut ts, &ctx);
         if let Some(slot) = self.doc.texture_set_mut(ts_id) {
             *slot = ts;
@@ -649,7 +997,9 @@ impl Session {
     /// Finish the stroke: the post-stroke document becomes one history entry (none if nothing
     /// was painted).
     pub fn end_stroke(&mut self) {
-        let Some(active) = self.stroke.take() else { return };
+        let Some(active) = self.stroke.take() else {
+            return;
+        };
         if self.doc != *self.history.current() {
             self.history.push(active.label, self.doc.clone());
             self.revision += 1;
@@ -672,10 +1022,18 @@ impl Session {
         for ts in &self.doc.texture_sets {
             let geo = self.scene.geometry.get(ts.material_slot, ts.resolution);
             let maps = self.mesh_maps.get(&ts.id).unwrap_or(&self.no_maps);
-            let ctx = EvalContext { geometry: &geo, resources: &self.resources, mesh_maps: maps };
+            let ctx = EvalContext {
+                geometry: &geo,
+                resources: &self.resources,
+                mesh_maps: maps,
+            };
             let tiles = self.composites.entry(ts.id).or_default().update(ts, &ctx);
             if !tiles.is_empty() {
-                out.push(CompositeUpdate { texture_set: ts.id, material_slot: ts.material_slot, tiles });
+                out.push(CompositeUpdate {
+                    texture_set: ts.id,
+                    material_slot: ts.material_slot,
+                    tiles,
+                });
             }
         }
         out
@@ -692,7 +1050,10 @@ impl Session {
     }
 
     /// Files an export with `settings` would write.
-    pub fn export_plan(&mut self, settings: &subcraft_export::ExportSettings) -> Vec<(String, String)> {
+    pub fn export_plan(
+        &mut self,
+        settings: &subcraft_export::ExportSettings,
+    ) -> Vec<(String, String)> {
         self.update_composites();
         let name = self.export_name();
         let sets = self.export_sets();
@@ -716,37 +1077,61 @@ impl Session {
     }
 
     /// Export every texture set's composite through `settings` into `dir`.
-    pub fn export_textures(&mut self, dir: &Path, settings: &subcraft_export::ExportSettings) -> Result<Vec<PathBuf>, String> {
+    pub fn export_textures(
+        &mut self,
+        dir: &Path,
+        settings: &subcraft_export::ExportSettings,
+    ) -> Result<Vec<PathBuf>, String> {
         self.update_composites();
         let name = self.export_name();
         let sets = self.export_sets();
-        subcraft_export::export(&self.scene.mesh, &name, &sets, settings, dir).map_err(|e| e.to_string())
+        subcraft_export::export(&self.scene.mesh, &name, &sets, settings, dir)
+            .map_err(|e| e.to_string())
     }
 
     // ----- assets --------------------------------------------------------------------------------
 
     /// Add a material preset as a fill layer above the selection.
-    pub fn add_material(&mut self, preset: &subcraft_assets::MaterialPreset) -> Result<(), CommandError> {
+    pub fn add_material(
+        &mut self,
+        preset: &subcraft_assets::MaterialPreset,
+    ) -> Result<(), CommandError> {
         let layer = preset.build(self.selected_texture_set());
-        self.execute(Command::InsertLayer { layer: Box::new(layer), label: format!("Material: {}", preset.name) })
+        self.execute(Command::InsertLayer {
+            layer: Box::new(layer),
+            label: format!("Material: {}", preset.name),
+        })
     }
 
     /// Add a smart material (folder of masked layers) above the selection.
-    pub fn add_smart_material(&mut self, smart: &subcraft_assets::SmartMaterial) -> Result<(), CommandError> {
+    pub fn add_smart_material(
+        &mut self,
+        smart: &subcraft_assets::SmartMaterial,
+    ) -> Result<(), CommandError> {
         for r in smart.resources() {
             self.resources.insert_shared(r.clone());
         }
         let layer = smart.build(self.selected_texture_set());
-        self.execute(Command::InsertLayer { layer: Box::new(layer), label: format!("Smart Material: {}", smart.name) })
+        self.execute(Command::InsertLayer {
+            layer: Box::new(layer),
+            label: format!("Smart Material: {}", smart.name),
+        })
     }
 
     /// Apply a smart mask to the selected layer.
-    pub fn apply_smart_mask(&mut self, mask: &subcraft_assets::SmartMask) -> Result<(), CommandError> {
+    pub fn apply_smart_mask(
+        &mut self,
+        mask: &subcraft_assets::SmartMask,
+    ) -> Result<(), CommandError> {
         let layer = self.selection.layer.ok_or(CommandError::LayerNotFound)?;
         for r in &mask.resources {
             self.resources.insert_shared(r.clone());
         }
-        self.execute(Command::ApplyMaskEffects { layer, effects: mask.effects.clone(), label: format!("Smart Mask: {}", mask.name) })
+        self.execute(Command::ApplyMaskEffects {
+            layer,
+            effects: mask.effects.clone(),
+            label: format!("Smart Mask: {}", mask.name),
+        })
     }
 
     /// Use a brush alpha for the next strokes.

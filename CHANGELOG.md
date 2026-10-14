@@ -5,6 +5,21 @@ What changed in SubCraft, newest first. Download the latest build from the
 
 ## Unreleased
 
+## 0.2.0-studio.1 (CalangoTech fork)
+
+- Import high poly without UVs for baking; keep UV validation for the paintable low poly.
+- Supersampled bakes, safe projection fallback, validated settings and lower temporary memory.
+- Draggable layer folders, inline rename, persistent locks and transactional undoable commands.
+- Non-destructive mask blur/dilation/erosion/contrast, 12 smart masks and 8 smart materials.
+- Bounded shared mask-prefix cache, revision-based synchronization, partial GPU upload snapshots,
+  cached 3D/2D previews and removal of the shelf's continuous idle redraw loop.
+- Brush context toolbar, material eyedropper, solo channels, orthographic view and workspace presets.
+- Recent projects, background recovery copies, portable Windows package and Portuguese guide.
+- Schema 3 (reads schema 1/2), 255 passing tests and a full bake/paint/save/reopen/export smoke.
+- See [Studio validation and measured benchmarks](docs/STUDIO.md).
+
+## Upstream unreleased
+
 ### New
 - **Web version**: use SubCraft in the browser at https://aalzard.github.io/subcraft/ (needs
   WebGPU). Open uploads files, Save and Export download them. FBX is desktop only, and big

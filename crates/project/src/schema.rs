@@ -9,12 +9,14 @@
 
 use serde::{Deserialize, Serialize};
 use subcraft_core::ChannelKind;
-use subcraft_doc::{BlendMode, ChannelFormat, FillSource, Generator, Levels, ProceduralParams, Projection};
+use subcraft_doc::{
+    BlendMode, ChannelFormat, FillSource, Generator, Levels, ProceduralParams, Projection,
+};
 use uuid::Uuid;
 
 /// 1: initial. 2: mask `Image` effect (v1 files load unchanged; v2 files need SubCraft >= 0.1 with
-/// image masks).
-pub const SCHEMA_VERSION: u32 = 2;
+/// image masks). 3: non-destructive spatial/contrast mask filters. Versions 1 and 2 still load.
+pub const SCHEMA_VERSION: u32 = 3;
 pub const FORMAT_NAME: &str = "subcraft-project";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,6 +74,9 @@ pub struct LayerV1 {
     pub id: Uuid,
     pub name: String,
     pub visible: bool,
+    /// Editing lock; older projects are unlocked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
     pub blend: Vec<BlendV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<MaskV1>,
@@ -108,12 +113,24 @@ fn one() -> f32 {
     1.0
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentV1 {
-    Paint { channels: Vec<PaintChannelV1> },
-    Fill { projection: Projection, channels: Vec<FillChannelV1> },
-    Folder { expanded: bool, children: Vec<LayerV1> },
+    Paint {
+        channels: Vec<PaintChannelV1>,
+    },
+    Fill {
+        projection: Projection,
+        channels: Vec<FillChannelV1>,
+    },
+    Folder {
+        expanded: bool,
+        children: Vec<LayerV1>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -136,13 +153,41 @@ pub struct MaskEffectV1 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MaskEffectKindV1 {
-    Paint { raster: String },
-    Fill { value: f32, procedural: Option<ProceduralParams>, projection: Projection },
-    Generator { generator: Generator },
-    Levels { levels: Levels },
+    Paint {
+        raster: String,
+    },
+    Fill {
+        value: f32,
+        procedural: Option<ProceduralParams>,
+        projection: Projection,
+    },
+    Generator {
+        generator: Generator,
+    },
+    Levels {
+        levels: Levels,
+    },
     Invert,
+    /// Schema 3.
+    Blur {
+        radius: u32,
+    },
+    Dilate {
+        radius: u32,
+    },
+    Erode {
+        radius: u32,
+    },
+    Contrast {
+        amount: f32,
+        pivot: f32,
+    },
     /// Schema 2.
-    Image { resource: Uuid, projection: Projection, invert: bool },
+    Image {
+        resource: Uuid,
+        projection: Projection,
+        invert: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
